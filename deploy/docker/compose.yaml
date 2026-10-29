@@ -1,0 +1,36 @@
+# Restricted-country hop. Enroll once, then run:
+#   docker compose run --rm dotvpn-relay init -config /data/config.yaml -decoy decoy.example.com:443
+#   docker compose run --rm dotvpn-relay enroll -config /data/config.yaml -control https://ctl.example.com -token <one-time token>
+#   docker compose up -d
+# The relay writes no access log; keep the Docker log driver on "none" or "local" with a small cap.
+services:
+  dotvpn-relay:
+    image: ghcr.io/payam-foundation/dotvpn-relay:${DOTVPN_VERSION:?set DOTVPN_VERSION to a release tag}
+    command: ["run", "-config", "/data/config.yaml"]
+    restart: unless-stopped
+    ports:
+      - "443:443/tcp"
+    volumes:
+      - relay:/data
+    read_only: true
+    tmpfs: ["/tmp:size=8m,mode=1777"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1
+    ulimits:
+      nofile: 1048576
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 0
+    logging:
+      driver: local
+      options: {max-size: 1m, max-file: "2"}
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/dotvpn-relay", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  relay:
