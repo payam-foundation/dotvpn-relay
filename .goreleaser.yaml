@@ -40,10 +40,12 @@ builds:
 # Raw binaries named dotvpn-relay_<os>_<arch>: install scripts and the Dockerfile
 # fetch exactly these and check them against checksums.txt.
 archives:
-  - ids: [dotvpn-relay]
+  - id: relay
+    ids: [dotvpn-relay]
     formats: [binary]
     name_template: "dotvpn-relay_{{ .Os }}_{{ .Arch }}"
-  - ids: [neutral]
+  - id: neutral
+    ids: [neutral]
     formats: [binary]
     name_template: "dotvpn-relay-neutral_{{ .Os }}_{{ .Arch }}"
 
