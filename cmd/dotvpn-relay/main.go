@@ -1,4 +1,4 @@
-// dotvpn-relay is the in-country stealth hop. It has no client or admin code.
+// Package main is the in-country stealth hop. It has no client or admin code.
 package main
 
 import (
@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -31,7 +32,9 @@ import (
 
 var version = "dev"
 
-const usage = `dotvpn-relay %s
+// usage takes the program name and the version. Names come from the binary
+// name (see prog), so a renamed binary never prints the project name.
+const usage = `%[1]s %[2]s
 
   init     write a config with a fresh identity key
   enroll   register this relay with control (one-time enrollment token)
@@ -39,12 +42,12 @@ const usage = `dotvpn-relay %s
   healthcheck  query the loopback health endpoint (container HEALTHCHECK)
   version  print version
 
-Run "dotvpn-relay <command> -h" for flags.
+Run "%[1]s <command> -h" for flags.
 `
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, usage, version)
+		fmt.Fprintf(os.Stderr, usage, prog(), version)
 		os.Exit(2)
 	}
 	cmds := map[string]func(context.Context, []string) error{
@@ -53,7 +56,7 @@ func main() {
 	}
 	run, ok := cmds[os.Args[1]]
 	if !ok {
-		fmt.Fprintf(os.Stderr, usage, version)
+		fmt.Fprintf(os.Stderr, usage, prog(), version)
 		os.Exit(2)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -63,42 +66,88 @@ func main() {
 			return
 		}
 		// Static prefix only; errors from the network can carry addresses.
-		fmt.Fprintln(os.Stderr, "dotvpn-relay:", err)
+		fmt.Fprintln(os.Stderr, prog()+":", err)
 		os.Exit(1)
 	}
 }
 
-func flags(name string) (*flag.FlagSet, *string) {
-	fs := flag.NewFlagSet("dotvpn-relay "+name, flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	return fs, fs.String("config", "", "config file (default: $DOTVPN_RELAY_CONFIG, /etc/dotvpn-relay/config.yaml as root, else the user config dir)")
+// prog is the binary's own name: flag sets, usage, the stderr prefix, the
+// default config path, the config env var and the metric name derive from it,
+// so an install under another name carries no project name.
+func prog() string { return filepath.Base(os.Args[0]) }
+
+// ident maps a program name to [a-z0-9_] for env var and metric names.
+func ident(p string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r + 'a' - 'A'
+		}
+		return '_'
+	}, p)
 }
 
+func envName(p string) string { return strings.ToUpper(ident(p)) + "_CONFIG" }
+
+func metricName(p string) string {
+	n := ident(p) + "_parked"
+	if n[0] >= '0' && n[0] <= '9' {
+		n = "_" + n
+	}
+	return n
+}
+
+func flags(name string) (*flag.FlagSet, *string) {
+	fs := flag.NewFlagSet(prog()+" "+name, flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	return fs, fs.String("config", "", "config file (default: $"+envName(prog())+", /etc/"+prog()+"/config.yaml as root, else the user config dir)")
+}
+
+// configPath: -config, then $<PROG>_CONFIG, then $DOTVPN_RELAY_CONFIG (kept for
+// existing installs), then /etc/<prog>/config.yaml as root, else the user config dir.
 func configPath(v string) string {
 	if v != "" {
 		return v
 	}
-	if v := os.Getenv("DOTVPN_RELAY_CONFIG"); v != "" {
-		return v
+	for _, e := range []string{envName(prog()), "DOTVPN_RELAY_CONFIG"} {
+		if v := os.Getenv(e); v != "" {
+			return v
+		}
 	}
 	if runtime.GOOS != "windows" && os.Geteuid() == 0 {
-		return "/etc/dotvpn-relay/config.yaml"
+		return "/etc/" + prog() + "/config.yaml"
 	}
 	d, err := os.UserConfigDir()
 	if err != nil {
 		d = "."
 	}
-	return filepath.Join(d, "dotvpn-relay", "config.yaml")
+	return filepath.Join(d, prog(), "config.yaml")
+}
+
+// readToken returns tok, or the first line of r when tok is "-", so the
+// enrollment token need not appear in argv (`ps`, shell history, journald).
+func readToken(tok string, r io.Reader) (string, error) {
+	if tok != "-" {
+		return tok, nil
+	}
+	b, err := io.ReadAll(io.LimitReader(r, 4096))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(b)), nil
 }
 
 func cmdInit(_ context.Context, args []string) error {
 	fs, cfg := flags("init")
 	listen := fs.String("listen", "", "public TCP listen address (default :443)")
-	decoy := fs.String("decoy", "", "host:port of a real TLS server for non-dotvpn visitors")
+	decoy := fs.String("decoy", "", "host:port of a real TLS server for everyone who is not a peer")
 	cert := fs.String("tls-cert", "", "built-in TLS decoy certificate (instead of -decoy)")
 	key := fs.String("tls-key", "", "built-in TLS decoy key")
 	dnsListen := fs.String("dns-listen", "", "enable the DNS-shaped UDP carrier on this address (e.g. :53)")
 	dnsZone := fs.String("dns-zone", "", "zone the DNS carrier answers for")
+	admin := fs.String("admin-listen", "", "loopback address for /healthz and /metrics (default 127.0.0.1:9101)")
 	force := fs.Bool("force", false, "overwrite an existing config (regenerates the identity)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -112,7 +161,7 @@ func cmdInit(_ context.Context, args []string) error {
 		return err
 	}
 	c := &config.Config{Listen: *listen, Decoy: *decoy, TLSCert: *cert, TLSKey: *key,
-		DNSListen: *dnsListen, DNSZone: *dnsZone, IdentityKey: auth.EncodeKey(priv)}
+		DNSListen: *dnsListen, DNSZone: *dnsZone, AdminListen: *admin, IdentityKey: auth.EncodeKey(priv)}
 	c.Defaults()
 	if err := c.Validate(); err != nil {
 		return err
@@ -131,7 +180,7 @@ func cmdInit(_ context.Context, args []string) error {
 func cmdEnroll(ctx context.Context, args []string) error {
 	fs, cfg := flags("enroll")
 	ctrl := fs.String("control", "", "control public API URL (https)")
-	token := fs.String("token", "", "one-time enrollment token from the core admin API")
+	token := fs.String("token", "", "one-time enrollment token from the core admin API; \"-\" reads it from stdin")
 	pin := fs.String("pin", "", "base64 SHA-256 SPKI pin of control's TLS key, for a self-signed control")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -145,14 +194,18 @@ func cmdEnroll(ctx context.Context, args []string) error {
 	if err != nil || u.Host == "" || (u.Scheme != "https" && !loopback.IsHost(u.Hostname())) {
 		return errors.New("-control must be an https URL")
 	}
-	if *token == "" {
+	tok, err := readToken(*token, os.Stdin)
+	if err != nil {
+		return err
+	}
+	if tok == "" {
 		return errors.New("-token required")
 	}
 	priv, err := auth.DecodePrivateKey(c.IdentityKey)
 	if err != nil {
-		return errors.New("identity_key invalid: run `dotvpn-relay init`")
+		return errors.New("identity_key invalid: run `" + prog() + " init`")
 	}
-	keys, err := enroll(ctx, u, *token, *pin, priv.Public().(ed25519.PublicKey))
+	keys, err := enroll(ctx, u, tok, *pin, priv.Public().(ed25519.PublicKey))
 	if err != nil {
 		return err
 	}
@@ -218,10 +271,10 @@ func cmdRun(ctx context.Context, args []string) error {
 func serve(ctx context.Context, c *config.Config) error {
 	priv, err := auth.DecodePrivateKey(c.IdentityKey)
 	if err != nil {
-		return errors.New("identity_key invalid: run `dotvpn-relay init`")
+		return errors.New("identity_key invalid: run `" + prog() + " init`")
 	}
 	if len(c.TrustedKeys) == 0 {
-		return errors.New("not enrolled: run `dotvpn-relay enroll`")
+		return errors.New("not enrolled: run `" + prog() + " enroll`")
 	}
 	var pubs []ed25519.PublicKey
 	for _, k := range c.TrustedKeys {
@@ -270,12 +323,12 @@ func serve(ctx context.Context, c *config.Config) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprintln(w, "ok") })
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprintf(w, "# TYPE dotvpn_relay_parked gauge\ndotvpn_relay_parked %d\n", srv.Parked())
+		fmt.Fprintf(w, "# TYPE %[1]s gauge\n%[1]s %[2]d\n", metricName(prog()), srv.Parked())
 	})
 	hs := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ErrorLog: slog.NewLogLogger(slog.DiscardHandler, slog.LevelError)}
 	go func() { <-ctx.Done(); _ = hs.Close() }()
 	go func() { _ = hs.Serve(adm) }()
-	log.Info("relay started")
+	log.Info("started")
 	select {
 	case <-ctx.Done():
 		return nil
@@ -285,8 +338,8 @@ func serve(ctx context.Context, c *config.Config) error {
 }
 
 func cmdHealthcheck(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("dotvpn-relay healthcheck", flag.ContinueOnError)
-	addr := fs.String("addr", "127.0.0.1:9101", "relay admin address")
+	fs := flag.NewFlagSet(prog()+" healthcheck", flag.ContinueOnError)
+	addr := fs.String("addr", "127.0.0.1:9101", "admin address")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}

@@ -13,3 +13,5 @@ The Hetzner audit (`dotvpn-lab/docs/hetzner-test-report.md`, "Relay exposure aud
 3. Real decoy in production. The built-in decoy (Go `net/http`, one static page, test certificate) is for tests. Production relays run `-decoy 127.0.0.1:443` in front of a stock nginx with a real certificate. Measured against stock nginx 1.28 (see the report): ServerHello, non-TLS replies and timing are identical through the relay.
 4. The knock ClientHello and every `DialTLS` hello come from one function, `mimic.ChromeCurrent`, which brings the utls Chrome 133 preset to what Chrome 156 sends. Re-measure with `dotvpn-lab/cmd/fpcheck` when browsers move on.
 5. Accepted residual risk: tunnelled traffic keeps its packet-size and timing shape (padding covers the handshake only); a relay's idle cover records are the only periodic signal; hosting provider netflow, payment identity and host conntrack link a relay to its operator.
+
+See also [ADR-016](016-lowkey-install.md): the lowkey install, which reduces what a relay host and binary reveal. It builds on, and does not change, the decisions here.
