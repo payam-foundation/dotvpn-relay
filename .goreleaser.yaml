@@ -14,6 +14,24 @@ builds:
       - CGO_ENABLED=0
     flags:
       - -trimpath
+      - -buildvcs=false
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    goos: [linux]
+    goarch: [amd64, arm64]
+
+  # Neutral build (ADR-016): same source, built with garble so the binary holds
+  # no project name, module path, dependency list or wire constant. Used by
+  # deploy/install.sh --lowkey. Needs garble on PATH (see ci.yml).
+  - id: neutral
+    main: ./cmd/dotvpn-relay
+    binary: dotvpn-relay-neutral
+    gobinary: ./deploy/garble-build.sh
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+      - -buildvcs=false
     ldflags:
       - -s -w -X main.version={{ .Version }}
     goos: [linux]
@@ -22,8 +40,12 @@ builds:
 # Raw binaries named dotvpn-relay_<os>_<arch>: install scripts and the Dockerfile
 # fetch exactly these and check them against checksums.txt.
 archives:
-  - formats: [binary]
+  - ids: [dotvpn-relay]
+    formats: [binary]
     name_template: "dotvpn-relay_{{ .Os }}_{{ .Arch }}"
+  - ids: [neutral]
+    formats: [binary]
+    name_template: "dotvpn-relay-neutral_{{ .Os }}_{{ .Arch }}"
 
 checksum:
   name_template: checksums.txt

@@ -84,11 +84,15 @@ func Load(path string) (*Config, error) {
 	return &c, nil
 }
 
-// Save writes atomically with mode 0600.
+// Save writes atomically, then sets mode 0640 (group-readable so a service
+// user can read a root-owned file; never world-readable).
 func Save(path string, c *Config) error {
 	b, err := yaml.Marshal(c)
 	if err != nil {
 		return err
 	}
-	return atomicfile.Write(path, b, 0o750)
+	if err := atomicfile.Write(path, b, 0o750); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o640)
 }

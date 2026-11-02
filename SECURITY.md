@@ -14,6 +14,6 @@ Only the latest tagged release of each repository receives security fixes. A wir
 
 ## Scope
 
-In scope: authentication, tunnel confidentiality and integrity, probe resistance of the relay and node decoy, kill-switch and leak guards in the client, SSRF and egress guards in core.
+In scope: authentication, tunnel confidentiality and integrity, probe resistance of the relay and node decoy, kill-switch and leak guards in the client, SSRF and egress guards in core, and the lowkey install (a project name or path that `install.sh --lowkey` leaves on the host, in a process listing, or in the neutral binary).
 
 Out of scope: claims that depend on a specific national censor's behaviour that cannot be reproduced, and denial of service by a network operator who simply blocks all traffic.

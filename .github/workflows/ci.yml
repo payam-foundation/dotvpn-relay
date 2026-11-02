@@ -99,8 +99,41 @@ jobs:
           go vet ./...
           go build -trimpath -o /dev/null ./cmd/dotvpn-relay
 
+  # ADR-016: the neutral build must compile, pass the tests, and carry no
+  # project name. garble is built with go.mod's Go (it refuses a newer one).
+  neutral:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+      - run: go mod edit -dropreplace=$WIRE_MODULE && go mod tidy
+      - name: garble
+        run: GOTOOLCHAIN=local go install mvdan.cc/garble@v0.18.0
+      - env:
+          CGO_ENABLED: "0"
+        run: |
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          garble -literals -tiny test -count=1 ./...
+          garble -literals -tiny build -trimpath -buildvcs=false -ldflags "-s -w" -o "$RUNNER_TEMP/neutral" ./cmd/dotvpn-relay
+          if strings -a "$RUNNER_TEMP/neutral" | grep -i -E 'dotvpn|payam'; then echo "project name in neutral binary" >&2; exit 1; fi
+          if go version -m "$RUNNER_TEMP/neutral" 2>&1 | grep -q 'path'; then echo "build info present" >&2; exit 1; fi
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: shellcheck deploy/install.sh deploy/garble-build.sh
+
   release:
-    needs: [test, security, cross]
+    needs: [test, security, cross, neutral, shellcheck]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -119,6 +152,8 @@ jobs:
       # Release builds use the pinned wire tag, never the local replace.
       - run: go mod edit -dropreplace=$WIRE_MODULE && go mod tidy && git diff --stat go.mod go.sum
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+      - name: garble
+        run: GOTOOLCHAIN=local go install mvdan.cc/garble@v0.18.0
       - uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0
       - uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
         with:
