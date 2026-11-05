@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/readme-header-dark.svg">
+  <img alt="Dot VPN" src=".github/readme-header-light.svg">
+</picture>
+
 # dotvpn-relay
 
 [![CI](https://github.com/payam-foundation/dotvpn-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/payam-foundation/dotvpn-relay/actions/workflows/ci.yml)
@@ -5,7 +10,7 @@
 [![Status: beta](https://img.shields.io/badge/status-beta-orange)](#status)
 [![License: PolyForm Noncommercial](https://img.shields.io/badge/license-PolyForm%20Noncommercial-blue)](LICENSE)
 
-The in-country stealth hop of [dotvpn](https://github.com/payam-foundation/dotvpn-wire#related-repositories). A relay looks like an ordinary HTTPS website to anyone who is not a dotvpn client, and splices clients onto tunnels that a `dotvpn-core` node has parked on it.
+The in-country stealth hop of [Dot VPN](https://github.com/payam-foundation/dotvpn-wire#related-repositories). A relay looks like an ordinary HTTPS website to anyone who is not a dotvpn client, and splices clients onto tunnels that a `dotvpn-core` node has parked on it.
 
 A relay has **no client code, no admin code, no user accounts, and no secret** other than its own identity key and control's public key. Seizing one exposes nothing that reaches core.
 
