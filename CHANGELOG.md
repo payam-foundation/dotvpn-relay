@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/payam-foundation/dotvpn-relay/compare/v0.2.0...v0.2.1) (2026-11-02)
+
+
+### Bug Fixes
+
+* give goreleaser archives distinct ids ([#10](https://github.com/payam-foundation/dotvpn-relay/issues/10)) ([7689138](https://github.com/payam-foundation/dotvpn-relay/commit/76891386022505b71310c6babc8d5fcd54cca4b4))
+
 ## [0.2.0](https://github.com/payam-foundation/dotvpn-relay/compare/v0.1.0...v0.2.0) (2026-11-02)
 
 
