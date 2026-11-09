@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # Relay installer (native systemd). Usage:
+#   # Curated (admin token; control URL used once, not stored):
 #   curl -fsSL https://raw.githubusercontent.com/payam-foundation/dotvpn-relay/main/deploy/install.sh \
-#     | sudo ENROLL_TOKEN=... bash -s -- --control https://ctl.example.com --decoy 127.0.0.1:8443 --lowkey
+#     | sudo ENROLL_TOKEN=... bash -s -- --decoy 127.0.0.1:8443 --lowkey
+#   # Community (open self-registration; stores control URL for optional beats):
+#   curl -fsSL https://raw.githubusercontent.com/payam-foundation/dotvpn-relay/main/deploy/install.sh \
+#     | sudo bash -s -- --register --sni cdn.example.com \
+#         --decoy 127.0.0.1:8443 --listen PUBLIC_IP:443
 #
-# Flags: --control URL      control API to enroll with (used once, never stored)
+# Flags: --control URL      control API URL (default https://ctrl.dotvpn.org)
+#        --register         community self-registration (no admin token; needs --sni)
+#        --sni HOST         SNI clients and nodes present (required with --register)
 #        --pin PIN          base64 SHA-256 SPKI pin for a self-signed control
 #        --decoy HOST:PORT  your real TLS web server (required)
 #        --listen ADDR      public listen address (default :443)
@@ -11,17 +18,21 @@
 #        --lowkey           neutral build; every name derives from --name (see ADR-016)
 #        --name N           lowkey install name (random if omitted, printed at the end)
 #        --quiet-logs       journald LogLevelMax=warning for the unit
+#        --no-beat          disable telemetry beats after community register
 #        --version vX.Y.Z   release to install (default latest)
 #        --from-dir DIR     use binaries and checksums.txt from DIR instead of downloading
 #        --token-stdin      read the enrollment token from stdin (else ENROLL_TOKEN, else a prompt)
 #        --upgrade | --rollback | --uninstall | --no-start | --no-firewall
 # Upgrade, rollback and uninstall need the same --lowkey/--name as the install.
+# Default control is https://ctrl.dotvpn.org (CDN). Override with --control for labs.
+# Curated enroll never stores --control. Community --register stores it for beats.
 # Lowkey lowers fingerprinting. It does not make a relay undetectable and does
 # not override your host's terms: read and follow its acceptable-use policy.
 set -euo pipefail
 
 REPO="${RELAY_REPO:-payam-foundation/dotvpn-relay}"
-CONTROL="" PIN="" DECOY="" LISTEN="" DNS_ZONE="" LOWKEY=0 NAME="" QUIET=0
+CONTROL="https://ctrl.dotvpn.org" PIN="" DECOY="" LISTEN="" DNS_ZONE="" SNI="" REGISTER=0 NO_BEAT=0
+LOWKEY=0 NAME="" QUIET=0
 VERSION=latest FROM_DIR="" TOKEN_STDIN=0 ACTION=install START=1 FIREWALL=1
 
 log() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
@@ -33,6 +44,8 @@ need() { [ $# -ge 2 ] || die "$1 needs a value"; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --control) need "$@"; CONTROL=$2; shift 2 ;;
+    --register) REGISTER=1; shift ;;
+    --sni) need "$@"; SNI=$2; shift 2 ;;
     --pin) need "$@"; PIN=$2; shift 2 ;;
     --decoy) need "$@"; DECOY=$2; shift 2 ;;
     --listen) need "$@"; LISTEN=$2; shift 2 ;;
@@ -40,6 +53,7 @@ while [ $# -gt 0 ]; do
     --lowkey) LOWKEY=1; shift ;;
     --name) need "$@"; NAME=$2; shift 2 ;;
     --quiet-logs) QUIET=1; shift ;;
+    --no-beat) NO_BEAT=1; shift ;;
     --version) need "$@"; VERSION=$2; shift 2 ;;
     --from-dir) need "$@"; FROM_DIR=$2; shift 2 ;;
     --token-stdin) TOKEN_STDIN=1; shift ;;
@@ -162,9 +176,10 @@ pick_admin_port() {
 }
 
 write_unit() {
-  local desc="dotvpn relay" extra=""
+  local desc="dotvpn relay" extra="" run_flags="-config $CONF"
   [ "$LOWKEY" -eq 1 ] && desc="$NAME"
   [ "$QUIET" -eq 1 ] && extra="LogLevelMax=warning"
+  [ "$NO_BEAT" -eq 1 ] && run_flags="$run_flags -no-beat"
   cat >"$UNIT_FILE" <<EOF
 [Unit]
 Description=$desc
@@ -174,7 +189,7 @@ Wants=network-online.target
 [Service]
 User=$NAME
 Group=$NAME
-ExecStart=$BIN run -config $CONF
+ExecStart=$BIN run $run_flags
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
@@ -247,10 +262,36 @@ read_token() {
   [ -n "${ENROLL_TOKEN:-}" ] || die "no enrollment token: set ENROLL_TOKEN, use --token-stdin, or run from a terminal"
 }
 
+listen_port() {
+  local a=${LISTEN:-:443}
+  case "$a" in
+    *:*) printf '%s' "${a##*:}" ;;
+    *) printf '%s' 443 ;;
+  esac
+}
+
 do_enroll() {
   ENROLLED=0
   if ! grep -q '^trusted_keys: \[\]' "$CONF"; then log "already enrolled"; ENROLLED=1; return; fi
-  [ -n "$CONTROL" ] || return 0
+  if [ "$REGISTER" -eq 1 ]; then
+    [ -n "$SNI" ] || die "--register needs --sni HOST"
+    local args=(register -config "$CONF" -control "$CONTROL" -sni "$SNI" -port "$(listen_port)")
+    [ -n "$PIN" ] && args+=(-pin "$PIN")
+    if [ -n "$DNS_ZONE" ]; then
+      args+=(-dns-port 53 -dns-zone "$DNS_ZONE")
+    fi
+    # Community register stores control_url (and optional pin) for beats.
+    "$BIN" "${args[@]}"
+    fix_conf_owner
+    ENROLLED=1
+    return
+  fi
+  # Curated enroll only when a token is available (env, stdin, or a tty prompt).
+  # Default --control alone must not fail a non-interactive install.
+  if [ -z "${ENROLL_TOKEN:-}" ] && [ "$TOKEN_STDIN" -eq 0 ] && [ ! -r /dev/tty ]; then
+    warn "not enrolled: set ENROLL_TOKEN for curated enroll, or pass --register --sni HOST"
+    return 0
+  fi
   read_token
   local args=(enroll -config "$CONF" -control "$CONTROL" -token -)
   [ -n "$PIN" ] && args+=(-pin "$PIN")
@@ -328,7 +369,10 @@ esac
 
 [ -f "$UNIT_FILE" ] && die "an install named $NAME exists: use --upgrade, or --uninstall first"
 check_decoy
-[ -z "$CONTROL" ] || printf '%s' "$CONTROL" | grep -Eq '^https://' || die "--control must be an https URL"
+[ -z "$SNI" ] || [ "$REGISTER" -eq 1 ] || die "--sni needs --register"
+[ "$REGISTER" -eq 0 ] || [ -n "$SNI" ] || die "--register needs --sni HOST"
+printf '%s' "$CONTROL" | grep -Eq '^https://' || die "--control must be an https URL"
+[ "$NO_BEAT" -eq 0 ] || [ "$REGISTER" -eq 1 ] || warn "--no-beat only affects community installs that store control_url"
 install_binary
 # A failure before the service starts (bad token, unreachable control) removes
 # what this run created, so the same command can be retried.
@@ -346,7 +390,13 @@ if [ "$START" -eq 1 ] && [ "$ENROLLED" -eq 1 ]; then
   systemctl is-active --quiet "$NAME.service" || { journalctl -u "$NAME.service" -n 30 --no-pager; die "service failed to start"; }
   log "running"
 else
-  [ "$ENROLLED" -eq 1 ] || warn "not enrolled: enroll, then start. e.g. printf '%s\\n' \"\$TOKEN\" | $BIN enroll -config $CONF -control URL -token -   then   systemctl enable --now $NAME"
+  if [ "$ENROLLED" -ne 1 ]; then
+    if [ "$REGISTER" -eq 1 ]; then
+      warn "not registered: $BIN register -config $CONF -control URL -sni HOST   then   systemctl enable --now $NAME"
+    else
+      warn "not enrolled: enroll, then start. e.g. printf '%s\\n' \"\$TOKEN\" | $BIN enroll -config $CONF -control URL -token -   then   systemctl enable --now $NAME"
+    fi
+  fi
   START=0
 fi
 
