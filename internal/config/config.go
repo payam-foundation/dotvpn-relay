@@ -25,8 +25,17 @@ type Config struct {
 	DNSZone   string `yaml:"dns_zone"`
 	// IdentityKey is the relay's base64url Ed25519 private key.
 	IdentityKey string `yaml:"identity_key"`
-	// TrustedKeys are control's public keys; set by `enroll`.
+	// TrustedKeys are control's public keys; set by `enroll` or `register`.
 	TrustedKeys []string `yaml:"trusted_keys"`
+	// RelayID is assigned by control. Name is set on open registration.
+	RelayID string `yaml:"relay_id,omitempty"`
+	Name    string `yaml:"name,omitempty"`
+	// ControlURL and ControlPin are persisted only after open `register`, so
+	// the relay can send optional beats. Admin `enroll` deliberately omits
+	// them so a seized curated relay does not point at control. Use
+	// `run -no-beat` to keep that posture after open register.
+	ControlURL string `yaml:"control_url,omitempty"`
+	ControlPin string `yaml:"control_pin,omitempty"`
 	// Decoy is host:port of a real TLS server that answers everything that is
 	// not a dotvpn peer (a stock nginx on this host is the best choice).
 	// Alternatively TLSCert and TLSKey enable a built-in TLS web server.

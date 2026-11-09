@@ -14,7 +14,7 @@ go test -race -count=1 ./...
 ## Invariants
 
 - Holds no client or admin code. Do not import anything that belongs to core or client.
-- Stores no secrets beyond its own identity key and control's public key; no static shared key (ADR-012, ADR-013).
+- Stores no secrets beyond its own identity key and control's public key; no static shared key (ADR-012, ADR-013). Admin `enroll` never writes control's URL. Community `register` may write `control_url` / `control_pin` for optional beats; `run -no-beat` turns beats off.
 - No access logs, no client IPs, no version banner, no domains or keys in errors or metrics.
 - Unauthenticated, invalid, replayed or probing connections are replayed byte for byte to the decoy, never closed or reset; timing stays uniform (ADR-014).
 - The built-in decoy is for tests. Production runs `-decoy` in front of a real web server (ADR-015).
@@ -28,7 +28,7 @@ go test -race -count=1 ./...
 
 ## Docs
 
-`docs/adr/`: ADR-012, 013, 014, 015. Security report: `../dotvpn-lab/docs/REPORT.md`.
+`docs/adr/`: ADR-012 through 016. Security report: `../dotvpn-lab/docs/REPORT.md`.
 
 ## Flow
 

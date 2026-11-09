@@ -6,12 +6,14 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -32,12 +34,17 @@ import (
 
 var version = "dev"
 
+// defaultControlURL is the production control plane (CDN fronted). Operators
+// override with -control for labs and self-hosted cores.
+const defaultControlURL = "https://ctrl.dotvpn.org"
+
 // usage takes the program name and the version. Names come from the binary
 // name (see prog), so a renamed binary never prints the project name.
 const usage = `%[1]s %[2]s
 
   init     write a config with a fresh identity key
   enroll   register this relay with control (one-time enrollment token)
+  register open self-registration with control (community relays)
   run      serve
   healthcheck  query the loopback health endpoint (container HEALTHCHECK)
   version  print version
@@ -51,7 +58,7 @@ func main() {
 		os.Exit(2)
 	}
 	cmds := map[string]func(context.Context, []string) error{
-		"init": cmdInit, "enroll": cmdEnroll, "run": cmdRun, "healthcheck": cmdHealthcheck,
+		"init": cmdInit, "enroll": cmdEnroll, "register": cmdRegister, "run": cmdRun, "healthcheck": cmdHealthcheck,
 		"version": func(context.Context, []string) error { fmt.Println(version); return nil },
 	}
 	run, ok := cmds[os.Args[1]]
@@ -179,7 +186,7 @@ func cmdInit(_ context.Context, args []string) error {
 // seized relay does not point at control.
 func cmdEnroll(ctx context.Context, args []string) error {
 	fs, cfg := flags("enroll")
-	ctrl := fs.String("control", "", "control public API URL (https)")
+	ctrl := fs.String("control", defaultControlURL, "control public API URL (https; default "+defaultControlURL+")")
 	token := fs.String("token", "", "one-time enrollment token from the core admin API; \"-\" reads it from stdin")
 	pin := fs.String("pin", "", "base64 SHA-256 SPKI pin of control's TLS key, for a self-signed control")
 	if err := fs.Parse(args); err != nil {
@@ -190,9 +197,9 @@ func cmdEnroll(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	u, err := url.Parse(*ctrl)
-	if err != nil || u.Host == "" || (u.Scheme != "https" && !loopback.IsHost(u.Hostname())) {
-		return errors.New("-control must be an https URL")
+	u, err := parseControlURL(*ctrl)
+	if err != nil {
+		return err
 	}
 	tok, err := readToken(*token, os.Stdin)
 	if err != nil {
@@ -205,59 +212,166 @@ func cmdEnroll(ctx context.Context, args []string) error {
 	if err != nil {
 		return errors.New("identity_key invalid: run `" + prog() + " init`")
 	}
-	keys, err := enroll(ctx, u, tok, *pin, priv.Public().(ed25519.PublicKey))
+	out, err := enroll(ctx, u, tok, *pin, priv.Public().(ed25519.PublicKey))
 	if err != nil {
 		return err
 	}
-	c.TrustedKeys = keys
+	c.TrustedKeys = out.TrustedKeys
+	c.RelayID = out.RelayID
+	// Admin enroll never stores control's URL or pin (ADR-012 seizure posture).
+	c.ControlURL = ""
+	c.ControlPin = ""
 	if err := config.Save(path, c); err != nil {
 		return err
 	}
-	fmt.Println("enrolled; trusted control keys:", len(keys))
+	fmt.Println("enrolled; trusted control keys:", len(out.TrustedKeys))
+	if out.RelayID != "" {
+		fmt.Println("relay_id:", out.RelayID)
+	}
 	return nil
 }
 
-func enroll(ctx context.Context, base *url.URL, token, pin string, pub ed25519.PublicKey) ([]string, error) {
+type enrollResult struct {
+	RelayID     string
+	TrustedKeys []string
+}
+
+func enroll(ctx context.Context, base *url.URL, token, pin string, pub ed25519.PublicKey) (enrollResult, error) {
 	body, _ := json.Marshal(map[string]string{"public_key": auth.EncodeKey(pub)})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base.JoinPath("/v1/relays/enroll").String(), bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return enrollResult{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	hc := &http.Client{Timeout: 20 * time.Second}
-	if pin != "" {
-		// Pinned self-signed control: skip chain verification, check the key instead.
-		hc.Transport = &http.Transport{TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true, // #nosec G402 -- VerifyConnection enforces the pin
-			MinVersion:         tls.VersionTLS12,
-			VerifyConnection: func(cs tls.ConnectionState) error {
-				if len(cs.PeerCertificates) == 0 || transport.SPKIPin(cs.PeerCertificates[0]) != pin {
-					return errors.New("control key does not match -pin")
-				}
-				return nil
-			},
-		}}
-	}
-	resp, err := hc.Do(req)
+	resp, err := controlClient(pin).Do(req)
 	if err != nil {
-		return nil, errors.New("control unreachable")
+		return enrollResult{}, errors.New("control unreachable")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("enrollment refused (%d)", resp.StatusCode)
+		return enrollResult{}, fmt.Errorf("enrollment refused (%d)", resp.StatusCode)
 	}
 	var out struct {
+		RelayID     string   `json:"relay_id"`
 		TrustedKeys []string `json:"trusted_keys"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&out); err != nil || len(out.TrustedKeys) == 0 {
-		return nil, errors.New("enrollment response invalid")
+		return enrollResult{}, errors.New("enrollment response invalid")
 	}
-	return out.TrustedKeys, nil
+	return enrollResult{RelayID: out.RelayID, TrustedKeys: out.TrustedKeys}, nil
+}
+
+func controlClient(pin string) *http.Client {
+	hc := &http.Client{Timeout: 20 * time.Second}
+	if pin == "" {
+		return hc
+	}
+	hc.Transport = &http.Transport{TLSClientConfig: &tls.Config{
+		// #nosec G402 -- VerifyConnection enforces the SPKI pin below.
+		// codeql[go/disabled-certificate-check] SPKI pin checked in VerifyConnection for self-signed control
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS12,
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 || transport.SPKIPin(cs.PeerCertificates[0]) != pin {
+				return errors.New("control key does not match -pin")
+			}
+			return nil
+		},
+	}}
+	return hc
+}
+
+func parseControlURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || (u.Scheme != "https" && !loopback.IsHost(u.Hostname())) {
+		return nil, errors.New("-control must be an https URL")
+	}
+	return u, nil
+}
+
+// cmdRegister self-registers a community relay without an admin token.
+func cmdRegister(ctx context.Context, args []string) error {
+	fs, cfg := flags("register")
+	ctrl := fs.String("control", defaultControlURL, "control public API URL (https; default "+defaultControlURL+")")
+	port := fs.Int("port", 443, "public TCP port control should dial")
+	sni := fs.String("sni", "", "SNI clients and nodes present")
+	dnsPort := fs.Int("dns-port", 0, "optional DNS-shaped UDP port")
+	dnsZone := fs.String("dns-zone", "", "zone for the DNS carrier")
+	pin := fs.String("pin", "", "base64 SHA-256 SPKI pin of control's TLS key")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	path := configPath(*cfg)
+	c, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+	u, err := parseControlURL(*ctrl)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(*sni) == "" {
+		return errors.New("-sni required")
+	}
+	if (*dnsPort == 0) != (*dnsZone == "") {
+		return errors.New("-dns-port and -dns-zone go together")
+	}
+	priv, err := auth.DecodePrivateKey(c.IdentityKey)
+	if err != nil {
+		return errors.New("identity_key invalid: run `" + prog() + " init`")
+	}
+	pub := priv.Public().(ed25519.PublicKey)
+	pubStr := auth.EncodeKey(pub)
+	ts := time.Now().Unix()
+	msg := []byte(fmt.Sprintf("register|%s|%d|%s|%d|%s|%d", pubStr, *port, *sni, *dnsPort, *dnsZone, ts))
+	sig := base64.RawURLEncoding.EncodeToString(ed25519.Sign(priv, msg))
+	body, _ := json.Marshal(map[string]any{
+		"public_key": pubStr, "port": *port, "sni": *sni,
+		"dns_port": *dnsPort, "dns_zone": *dnsZone, "timestamp": ts, "signature": sig,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.JoinPath("/v1/relays/register").String(), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := controlClient(*pin).Do(req)
+	if err != nil {
+		return errors.New("control unreachable")
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("registration refused (%d)", resp.StatusCode)
+	}
+	var out struct {
+		RelayID     string   `json:"relay_id"`
+		Name        string   `json:"name"`
+		Status      string   `json:"status"`
+		TrustedKeys []string `json:"trusted_keys"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil || out.RelayID == "" || len(out.TrustedKeys) == 0 {
+		return errors.New("registration response invalid")
+	}
+	c.TrustedKeys = out.TrustedKeys
+	c.RelayID = out.RelayID
+	c.Name = out.Name
+	c.ControlURL = u.String()
+	c.ControlPin = *pin
+	if err := config.Save(path, c); err != nil {
+		return err
+	}
+	fmt.Println("registered")
+	fmt.Println("relay_id:", out.RelayID)
+	fmt.Println("name:", out.Name)
+	fmt.Println("status:", out.Status)
+	fmt.Println("relay link: dotvpn-relay://" + out.RelayID)
+	return nil
 }
 
 func cmdRun(ctx context.Context, args []string) error {
 	fs, cfg := flags("run")
+	noBeat := fs.Bool("no-beat", false, "do not send telemetry beats to control")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -265,17 +379,16 @@ func cmdRun(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return serve(ctx, c)
+	return serve(ctx, c, !*noBeat)
 }
 
-func serve(ctx context.Context, c *config.Config) error {
+func serve(ctx context.Context, c *config.Config, beat bool) error {
 	priv, err := auth.DecodePrivateKey(c.IdentityKey)
 	if err != nil {
 		return errors.New("identity_key invalid: run `" + prog() + " init`")
 	}
-	if len(c.TrustedKeys) == 0 {
-		return errors.New("not enrolled: run `" + prog() + " enroll`")
-	}
+	// Empty trusted_keys is allowed so a relay can listen (decoy + knock)
+	// before register/enroll; pool auth rejects until keys are present.
 	var pubs []ed25519.PublicKey
 	for _, k := range c.TrustedKeys {
 		p, err := auth.DecodePublicKey(k)
@@ -328,12 +441,56 @@ func serve(ctx context.Context, c *config.Config) error {
 	hs := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ErrorLog: slog.NewLogLogger(slog.DiscardHandler, slog.LevelError)}
 	go func() { <-ctx.Done(); _ = hs.Close() }()
 	go func() { _ = hs.Serve(adm) }()
+	if beat && c.ControlURL != "" && c.RelayID != "" {
+		go beatLoop(ctx, c, priv, srv, log)
+	}
 	log.Info("started")
 	select {
 	case <-ctx.Done():
 		return nil
 	case err := <-errc:
 		return err
+	}
+}
+
+func beatLoop(ctx context.Context, c *config.Config, priv ed25519.PrivateKey, srv *relay.Server, log *slog.Logger) {
+	base, err := url.Parse(c.ControlURL)
+	if err != nil {
+		return
+	}
+	pub := auth.EncodeKey(priv.Public().(ed25519.PublicKey))
+	interval := 30*time.Second + time.Duration(rand.Int64N(int64(15*time.Second)))
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	send := func() {
+		ts := time.Now().Unix()
+		parked := srv.Parked()
+		msg := []byte(fmt.Sprintf("beat|%s|%s|%d|%d", c.RelayID, version, parked, ts))
+		sig := base64.RawURLEncoding.EncodeToString(ed25519.Sign(priv, msg))
+		body, _ := json.Marshal(map[string]any{
+			"relay_id": c.RelayID, "public_key": pub, "version": version,
+			"parked": parked, "timestamp": ts, "signature": sig,
+		})
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, base.JoinPath("/v1/relays/beat").String(), bytes.NewReader(body))
+		if err != nil {
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := controlClient(c.ControlPin).Do(req)
+		if err != nil {
+			log.Debug("beat failed")
+			return
+		}
+		_ = resp.Body.Close()
+	}
+	send()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			send()
+		}
 	}
 }
 

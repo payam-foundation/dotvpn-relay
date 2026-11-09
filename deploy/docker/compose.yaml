@@ -1,6 +1,10 @@
-# Restricted-country hop. Enroll once, then run:
-#   docker compose run --rm dotvpn-relay init -config /data/config.yaml -decoy decoy.example.com:443
-#   docker compose run --rm dotvpn-relay enroll -config /data/config.yaml -control https://ctl.example.com -token <one-time token>
+# Restricted-country hop. Init once, then either enroll (curated) or register (community).
+# enroll/register default to https://ctrl.dotvpn.org; pass -control for a lab core.
+#   docker compose run --rm dotvpn-relay init -config /data/config.yaml -decoy host.docker.internal:8443
+#   # curated (control URL not stored):
+#   docker compose run --rm -T dotvpn-relay enroll -config /data/config.yaml -token -
+#   # community (stores control_url for beats; add -no-beat to the service command to opt out):
+#   docker compose run --rm dotvpn-relay register -config /data/config.yaml -sni cdn.example.com -port 443
 #   docker compose up -d
 # The relay writes no access log; keep the Docker log driver on "none" or "local" with a small cap.
 services:

@@ -142,6 +142,9 @@ func (s *Server) handleTCP(c net.Conn) {
 	}
 	id, ok := s.pool.nodeFor(key)
 	if !ok {
+		// Knock matched KeysFn at classify time, but the last parked tunnel
+		// raced away. The mimic handshake already completed, so Fallback
+		// (raw decoy splice) is not valid here; close the carrier.
 		_ = conn.Close()
 		return
 	}
