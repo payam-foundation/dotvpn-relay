@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/payam-foundation/dotvpn-relay/compare/v0.2.1...v0.3.0) (2026-11-09)
+
+
+### Features
+
+* community self-registration and installer support ([#16](https://github.com/payam-foundation/dotvpn-relay/issues/16)) ([83f96d7](https://github.com/payam-foundation/dotvpn-relay/commit/83f96d7a1ac4ad1b251be19f3ee36726c1aec3ce))
+
 ## [0.2.1](https://github.com/payam-foundation/dotvpn-relay/compare/v0.2.0...v0.2.1) (2026-11-02)
 
 
