@@ -268,7 +268,9 @@ func controlClient(pin string) *http.Client {
 		return hc
 	}
 	hc.Transport = &http.Transport{TLSClientConfig: &tls.Config{
-		InsecureSkipVerify: true, // #nosec G402 -- VerifyConnection enforces the pin
+		// #nosec G402 -- VerifyConnection enforces the SPKI pin below.
+		// codeql[go/disabled-certificate-check] SPKI pin checked in VerifyConnection for self-signed control
+		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS12,
 		VerifyConnection: func(cs tls.ConnectionState) error {
 			if len(cs.PeerCertificates) == 0 || transport.SPKIPin(cs.PeerCertificates[0]) != pin {
