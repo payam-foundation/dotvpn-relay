@@ -2,8 +2,8 @@
 # Relay installer (native systemd).
 #
 # Non-interactive (safe for curl|bash; pass all required flags):
-#   curl -fsSL …/deploy/install.sh | sudo ENROLL_TOKEN=… bash -s -- \
-#     --decoy 127.0.0.1:8443 --listen PUBLIC_IP:443 --sni relay.example.com
+#   curl -fsSL …/deploy/install.sh | sudo ENROLL_TOKEN=… bash -s -- --decoy 127.0.0.1:8443
+#     (token loads listen/domain/dns from control; pass --listen/--sni to override)
 #   curl -fsSL …/deploy/install.sh | sudo bash -s -- --register --sni relay.example.com \
 #     --decoy 127.0.0.1:8443 --listen PUBLIC_IP:443
 #
@@ -214,42 +214,94 @@ is_cdn_ip() {
   return 1
 }
 
+this_host_ips() {
+  local out="" ip
+  ip=$(detect_public_ip)
+  [ -n "$ip" ] && out="$ip"
+  ip=$(detect_any_ipv4)
+  if [ -n "$ip" ] && [[ " $out " != *" $ip "* ]]; then
+    out="${out:+$out }$ip"
+  fi
+  if command -v hostname >/dev/null; then
+    for ip in $(hostname -I 2>/dev/null); do
+      [[ " $out " == *" $ip "* ]] && continue
+      out="${out:+$out }$ip"
+    done
+  fi
+  printf '%s' "$out"
+}
+
 check_domain_dns() {
-  local host=$1 ips ip match=0 any=0 pub
+  local host=$1 ips ip match=0 any=0 pub locals
   [ -n "$host" ] || return 0
   printf '%s' "$host" | grep -Eq '^[A-Za-z0-9.-]+$' || die "domain/SNI looks invalid: $host"
+  locals=$(this_host_ips)
+  pub=$(detect_public_ip)
+  [ -n "$pub" ] || pub=$(detect_any_ipv4)
   ips=$(resolve_host_ips "$host")
   if [ -z "$ips" ]; then
     if [ "$REQUIRE_DNS" -eq 1 ] || [ "$NONINTERACTIVE" -eq 0 ]; then
-      die "domain $host does not resolve; point an A/AAAA record at this host (DNS-only, not CDN-proxied)"
+      die "domain $host does not resolve; create a DNS-only A/AAAA to this host (${pub:-unknown IP}), not a proxied/orange-cloud record"
     fi
-    warn "domain $host does not resolve yet; clients need an A/AAAA to this host (use --require-dns to fail hard)"
+    warn "domain $host does not resolve yet; clients need a DNS-only A/AAAA to this host (${pub:-unknown}) (use --require-dns to fail hard)"
     return 0
   fi
   while IFS= read -r ip; do
     [ -n "$ip" ] || continue
     any=1
     if is_cdn_ip "$ip"; then
-      die "domain $host resolves to CDN edge $ip: relay knock needs DNS-only (grey-cloud). Orange-cloud / proxied CDN terminates TLS and breaks the relay"
+      die "domain $host → CDN edge $ip (proxied/orange-cloud). Relay knock needs DNS-only (grey-cloud) A/AAAA to THIS host (${pub:-unknown}). Cloudflare: DNS → record → Proxy status = DNS only"
     fi
   done <<< "$ips"
-  pub=$(detect_public_ip)
-  [ -n "$pub" ] || pub=$(detect_any_ipv4)
-  if [ -n "$pub" ]; then
+  if [ -n "$locals" ]; then
     while IFS= read -r ip; do
-      [ "$ip" = "$pub" ] && match=1
+      [ -n "$ip" ] || continue
+      for local_ip in $locals; do
+        [ "$ip" = "$local_ip" ] && match=1
+      done
     done <<< "$ips"
     if [ "$match" -eq 0 ]; then
       if [ "$REQUIRE_DNS" -eq 1 ] || [ "$NONINTERACTIVE" -eq 0 ]; then
-        die "domain $host resolves to [$ips] but this host is $pub; fix DNS (A/AAAA to this IP, not CDN)"
+        die "domain $host → [$(printf '%s' "$ips" | tr '\n' ' ')] but this host is ${pub:-$locals}. Set a DNS-only A/AAAA to ${pub:-that IP} (not CDN)"
       fi
-      warn "domain $host resolves to [$ips], host IP is $pub (continuing; pass --require-dns to fail)"
+      warn "domain $host → [$(printf '%s' "$ips" | tr '\n' ' ')], this host is ${pub:-$locals} (continuing; pass --require-dns to fail)"
     else
-      log "domain $host resolves to this host ($pub)"
+      log "domain $host resolves to this host (${pub:-$locals})"
     fi
   elif [ "$any" -eq 1 ]; then
     warn "could not detect this host's IP to compare with $host → $ips"
   fi
+}
+
+# Loads addr/sni/dns from a curated enroll token without consuming it.
+# Fills empty LISTEN/SNI/DNS_ZONE so the installer does not re-ask core answers.
+apply_enroll_pending() {
+  [ "$REGISTER" -eq 0 ] || return 0
+  [ -n "${ENROLL_TOKEN:-}" ] || return 0
+  command -v curl >/dev/null || die "curl is required to load pending relay metadata from the enroll token"
+  command -v python3 >/dev/null || die "python3 is required to parse pending relay metadata from control"
+  local url="${CONTROL%/}/v1/relays/enroll/pending" json parsed p_addr p_sni p_zone name
+  if ! json=$(curl -fsS --max-time 20 -H "Authorization: Bearer ${ENROLL_TOKEN}" -H "Accept: application/json" "$url" 2>/dev/null); then
+    die "could not load pending relay from token (expired, already used, wrong --control, or network). Re-create the relay in core if needed"
+  fi
+  parsed=$(printf '%s' "$json" | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+for k in ("addr","sni","dns_zone","name"):
+    print(d.get(k) or "")')
+  {
+    IFS= read -r p_addr
+    IFS= read -r p_sni
+    IFS= read -r p_zone
+    IFS= read -r name
+  } <<< "$parsed"
+  [ -n "$p_addr" ] && [ -n "$p_sni" ] || die "pending relay response missing addr/sni from $url"
+  if [ "$LISTEN_SET" -eq 0 ] || [ -z "$LISTEN" ]; then
+    LISTEN=$p_addr
+    LISTEN_SET=1
+  fi
+  [ -z "$SNI" ] && SNI=$p_sni
+  [ -z "$DNS_ZONE" ] && [ -n "$p_zone" ] && DNS_ZONE=$p_zone
+  log "from enroll token: name=${name:--} listen=$LISTEN domain=$SNI dns_zone=${DNS_ZONE:--}"
 }
 
 check_dns_carrier() {
@@ -398,14 +450,25 @@ run_guided_decoy() {
   esac
 }
 
+show_host_ip_hint() {
+  local ips
+  ips=$(this_host_ips)
+  if [ -n "$ips" ]; then
+    printf '%s\n' "This host IP(s): $ips" > /dev/tty
+    printf '%s\n' "Point a DNS-only (grey-cloud) A/AAAA at that IP. Proxied/orange-cloud CDN will fail." > /dev/tty
+  else
+    printf '%s\n' "Could not detect this host's public IP; you will need it for DNS." > /dev/tty
+  fi
+}
+
 interactive_fill() {
   [ "$ACTION" = install ] || return 0
   [ "$NONINTERACTIVE" -eq 0 ] || return 0
-  local mode_choice="" cand="" decoy_choice="" dns_choice="" listen_choice="" stack=""
+  local mode_choice="" cand="" decoy_choice="" adv_choice="" listen_choice="" stack="" curated_from_token=0
   echo > /dev/tty
   printf '%s\n' "Dot VPN relay installer" > /dev/tty
-  printf '%s\n' "Curated: admin creates the relay in core TUI/CLI and you paste a one-time token." > /dev/tty
-  printf '%s\n' "Community: self-register with control (no token); optional health beats." > /dev/tty
+  printf '%s\n' "Curated: create the relay in core first, then paste only the one-time token here." > /dev/tty
+  printf '%s\n' "Community: self-register (no token); you set domain/listen on this host." > /dev/tty
   echo > /dev/tty
   if [ "$REGISTER_SET" -eq 0 ]; then
     menu mode_choice "Mode" "enroll (curated token)" "register (community)" "abort"
@@ -417,29 +480,38 @@ interactive_fill() {
   fi
   if [ "$REGISTER" -eq 0 ] && [ "$INIT_ONLY" -eq 0 ]; then
     if [ -z "${ENROLL_TOKEN:-}" ]; then
-      printf '%s\n' "Create the relay first: dvadmin Relays → Add, or: dvadmin relays add NAME HOST:PORT DOMAIN" > /dev/tty
+      printf '%s\n' "On core: Relays → Add (name, public IP, port, domain). Then paste the token below." > /dev/tty
       IFS= read -rsp "enrollment token: " ENROLL_TOKEN < /dev/tty || true
       echo > /dev/tty
     fi
     [ -n "${ENROLL_TOKEN:-}" ] || die "no enrollment token: create a relay in core TUI/CLI first, or pass ENROLL_TOKEN / --init-only"
+    apply_enroll_pending
+    curated_from_token=1
   fi
-  if [ -z "$SNI" ]; then
-    prompt SNI "Domain / SNI (DNS A/AAAA to this host; DNS-only, not CDN-proxied)" ""
-    [ -n "$SNI" ] || die "domain/SNI is required"
-  fi
-  if [ "$LISTEN_SET" -eq 0 ]; then
-    cand=$(detect_public_ip)
-    [ -n "$cand" ] || cand=$(detect_any_ipv4)
-    if [ -n "$cand" ]; then
-      menu listen_choice "Public listen address" "${cand}:443" "custom"
-      if [[ "$listen_choice" == custom ]]; then
-        prompt LISTEN "Listen host:port" "${cand}:443"
-      else
-        LISTEN=$listen_choice
-      fi
-    else
-      prompt LISTEN "Public listen address (host:port or :port)" ":443"
+  if [ "$curated_from_token" -eq 0 ]; then
+    show_host_ip_hint
+    echo > /dev/tty
+    if [ -z "$SNI" ]; then
+      prompt SNI "Domain / SNI (DNS-only A/AAAA to this host)" ""
+      [ -n "$SNI" ] || die "domain/SNI is required"
     fi
+    if [ "$LISTEN_SET" -eq 0 ]; then
+      cand=$(detect_public_ip)
+      [ -n "$cand" ] || cand=$(detect_any_ipv4)
+      if [ -n "$cand" ]; then
+        menu listen_choice "Public listen address" "${cand}:443" "custom"
+        if [[ "$listen_choice" == custom ]]; then
+          prompt LISTEN "Listen host:port" "${cand}:443"
+        else
+          LISTEN=$listen_choice
+        fi
+      else
+        prompt LISTEN "Public listen address (host:port or :port)" ":443"
+      fi
+      LISTEN_SET=1
+    fi
+  else
+    printf '%s\n' "Using listen/domain/dns already set on core for this token." > /dev/tty
   fi
   validate_listen "${LISTEN:-:443}"
   stack=$(scan_web_stack)
@@ -448,16 +520,17 @@ interactive_fill() {
     menu decoy_choice "Decoy TLS site (probe resistance)" \
       "use / set up existing HOST:PORT" \
       "I already configured a site (enter HOST:PORT)" \
-      "guided setup now (system Caddy/nginx on loopback)" 
+      "guided setup now (system Caddy/nginx on loopback)"
     case "$decoy_choice" in
       guided*) SETUP_DECOY=1 ;;
       *"already"*) prompt DECOY "Decoy HOST:PORT" "127.0.0.1:8443" ;;
       *) prompt DECOY "Decoy HOST:PORT" "127.0.0.1:8443" ;;
     esac
   fi
-  if [ -z "$DNS_ZONE" ]; then
-    menu dns_choice "DNS carrier (UDP/53 protocol tunnel; skip unless you need it)" "off (recommended)" "enable"
-    if [[ "$dns_choice" == enable* ]]; then
+  # DNS carrier is advanced; curated tokens already carry dns_zone when set on core.
+  if [ -z "$DNS_ZONE" ] && [ "$curated_from_token" -eq 0 ]; then
+    menu adv_choice "Advanced options" "none (recommended)" "DNS carrier (UDP/53 protocol tunnel)"
+    if [[ "$adv_choice" == DNS* ]]; then
       prompt DNS_ZONE "DNS carrier zone suffix (e.g. carrier.example.com)" ""
       [ -n "$DNS_ZONE" ] || die "dns zone required when enabling the DNS carrier"
     fi
@@ -470,6 +543,10 @@ interactive_fill() {
 }
 
 interactive_fill
+# Non-interactive curated installs also pull listen/domain/dns from the token.
+if [ "$ACTION" = install ] && [ "$NONINTERACTIVE" -eq 1 ] && [ "$REGISTER" -eq 0 ] && [ -n "${ENROLL_TOKEN:-}" ]; then
+  apply_enroll_pending
+fi
 
 # Words for a random lowkey name. None may contain a forbidden token.
 WORDS=(amber birch cedar dune ember fjord grove harbor iris juniper kelp lumen maple nectar olive pebble quartz reed slate tundra)

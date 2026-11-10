@@ -8,7 +8,7 @@ Mode B authenticated with a static `X-Relay-Key` header: replayable, shared by e
 
 ## Decision
 
-A relay has its own Ed25519 identity. An admin creates a relay record on core and gets a one-time, short-lived enrollment token. `dotvpn-relay enroll` redeems it once; the token is then dead. The relay stores its identity key and control's public key and nothing else. Clients and nodes authenticate to the relay with short-lived tokens signed by control (audiences `""` for users, `pool` for nodes), which the relay verifies offline.
+A relay has its own Ed25519 identity. An admin creates a relay record on core and gets a one-time, short-lived enrollment token. `GET /v1/relays/enroll/pending` returns the pending addr/SNI/DNS metadata without consuming the token so installers can skip questions already answered on core. `dotvpn-relay enroll` redeems the token once; it is then dead. The relay stores its identity key and control's public key and nothing else. Clients and nodes authenticate to the relay with short-lived tokens signed by control (audiences `""` for users, `pool` for nodes), which the relay verifies offline.
 
 Control keeps a revocation per relay. `DELETE /v1/admin/relays/{id}` removes it from client lists and blocks re-enrollment. The old header grants nothing.
 
