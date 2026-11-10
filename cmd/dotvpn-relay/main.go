@@ -96,7 +96,17 @@ func main() {
 // prog is the binary's own name: flag sets, usage, the stderr prefix, the
 // default config path, the config env var and the metric name derive from it,
 // so an install under another name carries no project name.
-func prog() string { return filepath.Base(os.Args[0]) }
+// Symlink aliases (e.g. dvrelay → dotvpn-relay) resolve to the real basename
+// so status/doctor find /etc/dotvpn-relay and the systemd unit.
+func prog() string {
+	if p, err := os.Executable(); err == nil {
+		if real, err := filepath.EvalSymlinks(p); err == nil {
+			return filepath.Base(real)
+		}
+		return filepath.Base(p)
+	}
+	return filepath.Base(os.Args[0])
+}
 
 // ident maps a program name to [a-z0-9_] for env var and metric names.
 func ident(p string) string {
