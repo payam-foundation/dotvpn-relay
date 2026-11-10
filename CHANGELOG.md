@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/payam-foundation/dotvpn-relay/compare/v0.5.0...v0.6.0) (2026-11-10)
+
+
+### Features
+
+* **deploy:** skip curated fields already set on the enroll token ([#22](https://github.com/payam-foundation/dotvpn-relay/issues/22)) ([9229f73](https://github.com/payam-foundation/dotvpn-relay/commit/9229f73a86f506b6023b69e24de70c9102c4ab43))
+
 ## [0.5.0](https://github.com/payam-foundation/dotvpn-relay/compare/v0.4.0...v0.5.0) (2026-11-10)
 
 
