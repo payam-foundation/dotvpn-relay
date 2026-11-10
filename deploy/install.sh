@@ -132,7 +132,8 @@ prompt() { # var prompt default
 
 menu() { # var prompt options...  (numbered; stores selected value in var)
   local _var=$1 _p=$2; shift 2
-  local _opts=("$@") _i=1 _ans="" _n=${#_opts[@]}
+  local -a _opts=("$@")
+  local _i=1 _ans="" _n=${#_opts[@]}
   printf '%s\n' "$_p" > /dev/tty
   for opt in "${_opts[@]}"; do
     printf '  %d) %s\n' "$_i" "$opt" > /dev/tty
@@ -281,7 +282,7 @@ validate_decoy_tls() {
   host=$DECOY_HOST; port=$DECOY_PORT
   (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null || die "nothing answers on $DECOY: start the web server or use guided decoy setup"
   if command -v openssl >/dev/null; then
-    echo | openssl s_client -connect "$host:$port" -servername "${SNI:-localhost}" </dev/null 2>/dev/null | grep -q 'BEGIN CERTIFICATE' \
+    openssl s_client -connect "$host:$port" -servername "${SNI:-localhost}" </dev/null 2>/dev/null | grep -q 'BEGIN CERTIFICATE' \
       || die "decoy $DECOY did not complete a TLS handshake"
   fi
 }
