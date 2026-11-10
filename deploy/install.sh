@@ -3,8 +3,8 @@
 #
 # Non-interactive (safe for curl|bash; pass all required flags):
 #   curl -fsSL …/deploy/install.sh | sudo ENROLL_TOKEN=… bash -s -- \
-#     --decoy 127.0.0.1:8443 --listen PUBLIC_IP:443
-#   curl -fsSL …/deploy/install.sh | sudo bash -s -- --register --sni cdn.example.com \
+#     --decoy 127.0.0.1:8443 --listen PUBLIC_IP:443 --sni relay.example.com
+#   curl -fsSL …/deploy/install.sh | sudo bash -s -- --register --sni relay.example.com \
 #     --decoy 127.0.0.1:8443 --listen PUBLIC_IP:443
 #
 # Interactive (download first so stdin is a TTY):
@@ -12,11 +12,15 @@
 #
 # Flags: --control URL      control API URL (default https://ctrl.dotvpn.org)
 #        --register         community self-registration (no admin token; needs --sni)
-#        --sni HOST         SNI clients and nodes present (required with --register)
+#        --sni HOST         domain/SNI clients and nodes present (required with --register;
+#                           recommended with curated enroll so control can match)
 #        --pin PIN          base64 SHA-256 SPKI pin for a self-signed control
-#        --decoy HOST:PORT  your real TLS web server (required)
-#        --listen ADDR      public listen address (default: detected PUBLIC_IP:443 interactively, else :443)
+#        --decoy HOST:PORT  your real TLS web server (required unless --setup-decoy)
+#        --setup-decoy      guided system Caddy/nginx on loopback for --sni
+#        --listen ADDR      public listen address (host:port or :port; default PUBLIC_IP:443)
 #        --dns-zone Z       enable the DNS carrier on :53 for zone Z (off by default)
+#        --require-dns      fail if --sni does not resolve to this host
+#        --init-only        install binary+config without enroll/register/start
 #        --lowkey           neutral build; every name derives from --name (see ADR-016)
 #        --name N           lowkey install name (random if omitted, printed at the end)
 #        --quiet-logs       journald LogLevelMax=warning for the unit
@@ -32,6 +36,8 @@
 # REQUIRE_COSIGN=1), the installer verifies checksums.txt.sigstore.json.
 # Upgrade, rollback and uninstall need the same --lowkey/--name as the install.
 # Curated enroll never stores --control. Community --register stores it for beats.
+# Decoy is the operator's real site (ADR-015/016). --setup-decoy may install a
+# system Caddy/nginx for the operator domain; Caddy is never embedded in the binary.
 set -euo pipefail
 
 REPO="${RELAY_REPO:-payam-foundation/dotvpn-relay}"
@@ -39,6 +45,8 @@ CONTROL="https://ctrl.dotvpn.org" PIN="" DECOY="" LISTEN="" DNS_ZONE="" SNI="" R
 LOWKEY=0 NAME="" QUIET=0
 VERSION=latest FROM_DIR="" TOKEN_STDIN=0 ACTION=install START=1 FIREWALL=1
 NONINTERACTIVE=0 PURGE_FW=0 LISTEN_SET=0 REGISTER_SET=0
+SETUP_DECOY=0 REQUIRE_DNS=0 INIT_ONLY=0
+DECOY_SITE_ROOT=""
 
 log() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
@@ -53,8 +61,11 @@ while [ $# -gt 0 ]; do
     --sni) need "$@"; SNI=$2; shift 2 ;;
     --pin) need "$@"; PIN=$2; shift 2 ;;
     --decoy) need "$@"; DECOY=$2; shift 2 ;;
+    --setup-decoy) SETUP_DECOY=1; shift ;;
     --listen) need "$@"; LISTEN=$2; LISTEN_SET=1; shift 2 ;;
     --dns-zone) need "$@"; DNS_ZONE=$2; shift 2 ;;
+    --require-dns) REQUIRE_DNS=1; shift ;;
+    --init-only) INIT_ONLY=1; START=0; shift ;;
     --lowkey) LOWKEY=1; shift ;;
     --name) need "$@"; NAME=$2; shift 2 ;;
     --quiet-logs) QUIET=1; shift ;;
@@ -97,6 +108,17 @@ detect_public_ip() {
   esac
 }
 
+detect_any_ipv4() {
+  local ip=""
+  if command -v ip >/dev/null; then
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')
+  fi
+  if [ -z "$ip" ] && command -v hostname >/dev/null; then
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  fi
+  printf '%s' "$ip"
+}
+
 prompt() { # var prompt default
   local _var=$1 _p=$2 _d=${3:-} _ans=""
   if [ -r /dev/tty ]; then
@@ -108,39 +130,340 @@ prompt() { # var prompt default
   printf -v "$_var" '%s' "$_ans"
 }
 
+menu() { # var prompt options...  (numbered; stores selected value in var)
+  local _var=$1 _p=$2; shift 2
+  local -a _opts=("$@")
+  local _i=1 _ans="" _n=${#_opts[@]}
+  printf '%s\n' "$_p" > /dev/tty
+  for opt in "${_opts[@]}"; do
+    printf '  %d) %s\n' "$_i" "$opt" > /dev/tty
+    _i=$((_i + 1))
+  done
+  printf 'Choice [1]: ' > /dev/tty
+  IFS= read -r _ans < /dev/tty || true
+  [ -n "$_ans" ] || _ans=1
+  case "$_ans" in
+    *[!0-9]*|"") die "invalid menu choice" ;;
+  esac
+  if [ "$_ans" -lt 1 ] || [ "$_ans" -gt "$_n" ]; then
+    die "invalid menu choice"
+  fi
+  printf -v "$_var" '%s' "${_opts[_ans-1]}"
+}
+
+# validate_listen accepts host:port, [ipv6]:port, or :port. Rejects bare "2083".
+validate_listen() {
+  local a=$1
+  printf '%s' "$a" | grep -Eq '^(\[[0-9a-fA-F:]+\]|[^:[:space:]]*)?:[0-9]{1,5}$' \
+    || die "listen must be host:port or :port (got $a); e.g. $(detect_any_ipv4):443 or :443 — not bare 2083"
+  local port=${a##*:}
+  if ! [ "$port" -ge 1 ] 2>/dev/null || ! [ "$port" -le 65535 ] 2>/dev/null; then
+    die "listen port out of range: $port"
+  fi
+}
+
+listen_includes_loopback() {
+  local a=${1:-:443} host
+  case "$a" in
+    :*|0.0.0.0:*|"[::]":*|"[::0]":*) return 0 ;;
+  esac
+  host=${a%:*}
+  host=${host#[}; host=${host%]}
+  case "$host" in
+    ""|127.*|localhost|::1|0.0.0.0|::) return 0 ;;
+  esac
+  return 1
+}
+
+decoy_host_port() {
+  DECOY_HOST=${DECOY%:*}
+  DECOY_PORT=${DECOY##*:}
+  DECOY_HOST=${DECOY_HOST#[}; DECOY_HOST=${DECOY_HOST%]}
+}
+
+check_listen_decoy_collision() {
+  decoy_host_port
+  case "$DECOY_HOST" in 127.*|localhost|::1)
+    if [ "$DECOY_PORT" = "$(listen_port)" ] && listen_includes_loopback "${LISTEN:-:443}"; then
+      die "listen ${LISTEN:-:443} includes loopback, so decoy $DECOY collides: pass --listen PUBLIC_IP:$(listen_port) or move the web server to another port"
+    fi
+    ;;
+  esac
+}
+
+resolve_host_ips() {
+  local host=$1
+  if command -v getent >/dev/null; then
+    getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u
+    return 0
+  fi
+  if command -v dig >/dev/null; then
+    dig +short A "$host" 2>/dev/null | sort -u
+    return 0
+  fi
+  printf ''
+}
+
+# Cloudflare / common CDN edge ranges used to refuse proxied DNS in front of a relay.
+is_cdn_ip() {
+  local ip=$1
+  case "$ip" in
+    104.16.*|104.17.*|104.18.*|104.19.*|104.20.*|104.21.*|104.22.*|104.23.*|104.24.*|104.25.*|104.26.*|104.27.*|104.28.*) return 0 ;;
+    172.64.*|172.65.*|172.66.*|172.67.*|173.245.*|188.114.*|190.93.*|197.234.*|198.41.*) return 0 ;;
+  esac
+  return 1
+}
+
+check_domain_dns() {
+  local host=$1 ips ip match=0 any=0 pub
+  [ -n "$host" ] || return 0
+  printf '%s' "$host" | grep -Eq '^[A-Za-z0-9.-]+$' || die "domain/SNI looks invalid: $host"
+  ips=$(resolve_host_ips "$host")
+  if [ -z "$ips" ]; then
+    if [ "$REQUIRE_DNS" -eq 1 ] || [ "$NONINTERACTIVE" -eq 0 ]; then
+      die "domain $host does not resolve; point an A/AAAA record at this host (DNS-only, not CDN-proxied)"
+    fi
+    warn "domain $host does not resolve yet; clients need an A/AAAA to this host (use --require-dns to fail hard)"
+    return 0
+  fi
+  while IFS= read -r ip; do
+    [ -n "$ip" ] || continue
+    any=1
+    if is_cdn_ip "$ip"; then
+      die "domain $host resolves to CDN edge $ip: relay knock needs DNS-only (grey-cloud). Orange-cloud / proxied CDN terminates TLS and breaks the relay"
+    fi
+  done <<< "$ips"
+  pub=$(detect_public_ip)
+  [ -n "$pub" ] || pub=$(detect_any_ipv4)
+  if [ -n "$pub" ]; then
+    while IFS= read -r ip; do
+      [ "$ip" = "$pub" ] && match=1
+    done <<< "$ips"
+    if [ "$match" -eq 0 ]; then
+      if [ "$REQUIRE_DNS" -eq 1 ] || [ "$NONINTERACTIVE" -eq 0 ]; then
+        die "domain $host resolves to [$ips] but this host is $pub; fix DNS (A/AAAA to this IP, not CDN)"
+      fi
+      warn "domain $host resolves to [$ips], host IP is $pub (continuing; pass --require-dns to fail)"
+    else
+      log "domain $host resolves to this host ($pub)"
+    fi
+  elif [ "$any" -eq 1 ]; then
+    warn "could not detect this host's IP to compare with $host → $ips"
+  fi
+}
+
+check_dns_carrier() {
+  [ -n "$DNS_ZONE" ] || return 0
+  printf '%s' "$DNS_ZONE" | grep -Eq '^[A-Za-z0-9.-]+$' || die "dns-zone looks invalid: $DNS_ZONE"
+  if ss -uln 2>/dev/null | grep -Eq '(:|\.)53\s'; then
+    die "UDP/53 is already in use; free it before enabling the DNS carrier, or skip --dns-zone"
+  fi
+  if command -v systemctl >/dev/null; then
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+      warn "systemd-resolved is active; it often binds UDP/53 — the DNS carrier may fail to start"
+    fi
+  fi
+  log "DNS carrier zone=$DNS_ZONE (UDP/53 protocol suffix — not a normal authoritative DNS host)"
+}
+
+scan_web_stack() {
+  local hits=""
+  if systemctl is-active --quiet caddy 2>/dev/null || command -v caddy >/dev/null; then
+    hits="${hits}caddy "
+  fi
+  if systemctl is-active --quiet nginx 2>/dev/null || command -v nginx >/dev/null; then
+    hits="${hits}nginx "
+  fi
+  if ss -tln 2>/dev/null | grep -Eq '(:|\.)443\s'; then
+    hits="${hits}listener:443 "
+  fi
+  printf '%s' "$hits"
+}
+
+validate_decoy_tls() {
+  local host port
+  decoy_host_port
+  host=$DECOY_HOST; port=$DECOY_PORT
+  (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null || die "nothing answers on $DECOY: start the web server or use guided decoy setup"
+  if command -v openssl >/dev/null; then
+    openssl s_client -connect "$host:$port" -servername "${SNI:-localhost}" </dev/null 2>/dev/null | grep -q 'BEGIN CERTIFICATE' \
+      || die "decoy $DECOY did not complete a TLS handshake"
+  fi
+}
+
+pkg_install() {
+  local pkg=$1
+  if command -v apt-get >/dev/null; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg"
+  elif command -v dnf >/dev/null; then
+    dnf install -y "$pkg"
+  elif command -v yum >/dev/null; then
+    yum install -y "$pkg"
+  else
+    die "no apt/dnf/yum to install $pkg; install a TLS web server yourself and pass --decoy"
+  fi
+}
+
+setup_decoy_caddy() {
+  local domain=$1 root=$2
+  command -v caddy >/dev/null || pkg_install caddy
+  command -v caddy >/dev/null || die "caddy install failed"
+  install -d -m 0755 "$root"
+  if [ ! -f "$root/index.html" ]; then
+    cat >"$root/index.html" <<EOF
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>$domain</title></head>
+<body><h1>$domain</h1><p>Operator site.</p></body></html>
+EOF
+  fi
+  cat >/etc/caddy/Caddyfile <<EOF
+{
+  auto_https disable_redirects
+  http_port 8080
+  https_port 8443
+}
+$domain:8443 {
+  bind 127.0.0.1
+  root * $root
+  file_server
+  header -Alt-Svc
+}
+EOF
+  systemctl enable --now caddy
+  sleep 1
+  DECOY="127.0.0.1:8443"
+  log "guided Caddy decoy on $DECOY for $domain (site root $root)"
+}
+
+setup_decoy_nginx() {
+  local domain=$1 root=$2
+  command -v nginx >/dev/null || pkg_install nginx
+  command -v nginx >/dev/null || die "nginx install failed"
+  install -d -m 0755 "$root" /etc/nginx/ssl
+  if [ ! -f "$root/index.html" ]; then
+    cat >"$root/index.html" <<EOF
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>$domain</title></head>
+<body><h1>$domain</h1><p>Operator site.</p></body></html>
+EOF
+  fi
+  if [ ! -f /etc/nginx/ssl/decoy.crt ]; then
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+      -keyout /etc/nginx/ssl/decoy.key -out /etc/nginx/ssl/decoy.crt \
+      -subj "/CN=$domain" -addext "subjectAltName=DNS:$domain" -days 825 2>/dev/null \
+      || openssl req -x509 -newkey rsa:2048 -nodes \
+      -keyout /etc/nginx/ssl/decoy.key -out /etc/nginx/ssl/decoy.crt \
+      -subj "/CN=$domain" -days 825
+  fi
+  cat >/etc/nginx/sites-available/dotvpn-decoy <<EOF
+server {
+  listen 127.0.0.1:8443 ssl;
+  server_name $domain;
+  ssl_certificate /etc/nginx/ssl/decoy.crt;
+  ssl_certificate_key /etc/nginx/ssl/decoy.key;
+  root $root;
+  index index.html;
+  add_header Alt-Svc "" always;
+}
+EOF
+  ln -sfn /etc/nginx/sites-available/dotvpn-decoy /etc/nginx/sites-enabled/dotvpn-decoy 2>/dev/null || true
+  nginx -t
+  systemctl enable --now nginx
+  systemctl reload nginx 2>/dev/null || systemctl restart nginx
+  DECOY="127.0.0.1:8443"
+  log "guided nginx decoy on $DECOY for $domain (site root $root; self-signed until you add a real cert)"
+}
+
+run_guided_decoy() {
+  local domain=$1 choice="caddy" root
+  [ -n "$domain" ] || die "guided decoy needs a domain (--sni)"
+  root="${DECOY_SITE_ROOT:-/var/www/$domain}"
+  if [ "$NONINTERACTIVE" -eq 0 ]; then
+    prompt root "Site root directory for decoy content" "$root"
+    if command -v caddy >/dev/null || command -v apt-get >/dev/null; then
+      menu choice "Decoy web server" "caddy (recommended)" "nginx"
+      case "$choice" in nginx*) choice=nginx ;; *) choice=caddy ;; esac
+    else
+      choice=nginx
+    fi
+  else
+    if command -v caddy >/dev/null; then choice=caddy
+    elif command -v nginx >/dev/null; then choice=nginx
+    else choice=caddy
+    fi
+  fi
+  DECOY_SITE_ROOT=$root
+  case "$choice" in
+    nginx) setup_decoy_nginx "$domain" "$root" ;;
+    *) setup_decoy_caddy "$domain" "$root" ;;
+  esac
+}
+
 interactive_fill() {
   [ "$ACTION" = install ] || return 0
   [ "$NONINTERACTIVE" -eq 0 ] || return 0
-  local mode="enroll" cand=""
+  local mode_choice="" cand="" decoy_choice="" dns_choice="" listen_choice="" stack=""
+  echo > /dev/tty
+  printf '%s\n' "Dot VPN relay installer" > /dev/tty
+  printf '%s\n' "Curated: admin creates the relay in core TUI/CLI and you paste a one-time token." > /dev/tty
+  printf '%s\n' "Community: self-register with control (no token); optional health beats." > /dev/tty
+  echo > /dev/tty
   if [ "$REGISTER_SET" -eq 0 ]; then
-    prompt mode "Mode: enroll (curated token) or register (community)" "enroll"
-    case "$mode" in
-      register|community) REGISTER=1 ;;
-      enroll|curated|"") REGISTER=0 ;;
-      *) die "mode must be enroll or register" ;;
+    menu mode_choice "Mode" "enroll (curated token)" "register (community)" "abort"
+    case "$mode_choice" in
+      register*) REGISTER=1 ;;
+      abort*) die "aborted" ;;
+      *) REGISTER=0 ;;
     esac
   fi
-  if [ -z "$DECOY" ]; then
-    prompt DECOY "Decoy TLS web server HOST:PORT" "127.0.0.1:8443"
+  if [ "$REGISTER" -eq 0 ] && [ "$INIT_ONLY" -eq 0 ]; then
+    if [ -z "${ENROLL_TOKEN:-}" ]; then
+      printf '%s\n' "Create the relay first: dvadmin Relays → Add, or: dvadmin relays add NAME HOST:PORT DOMAIN" > /dev/tty
+      IFS= read -rsp "enrollment token: " ENROLL_TOKEN < /dev/tty || true
+      echo > /dev/tty
+    fi
+    [ -n "${ENROLL_TOKEN:-}" ] || die "no enrollment token: create a relay in core TUI/CLI first, or pass ENROLL_TOKEN / --init-only"
+  fi
+  if [ -z "$SNI" ]; then
+    prompt SNI "Domain / SNI (DNS A/AAAA to this host; DNS-only, not CDN-proxied)" ""
+    [ -n "$SNI" ] || die "domain/SNI is required"
   fi
   if [ "$LISTEN_SET" -eq 0 ]; then
     cand=$(detect_public_ip)
+    [ -n "$cand" ] || cand=$(detect_any_ipv4)
     if [ -n "$cand" ]; then
-      prompt LISTEN "Public listen address" "${cand}:443"
+      menu listen_choice "Public listen address" "${cand}:443" "custom"
+      if [[ "$listen_choice" == custom ]]; then
+        prompt LISTEN "Listen host:port" "${cand}:443"
+      else
+        LISTEN=$listen_choice
+      fi
     else
-      prompt LISTEN "Public listen address (host:port; avoid bare :443 if decoy is on loopback:443)" ""
+      prompt LISTEN "Public listen address (host:port or :port)" ":443"
     fi
   fi
-  if [ "$REGISTER" -eq 1 ] && [ -z "$SNI" ]; then
-    prompt SNI "SNI clients and nodes present" ""
+  validate_listen "${LISTEN:-:443}"
+  stack=$(scan_web_stack)
+  if [ -z "$DECOY" ] && [ "$SETUP_DECOY" -eq 0 ]; then
+    [ -n "$stack" ] && printf 'Detected web stack: %s\n' "$stack" > /dev/tty
+    menu decoy_choice "Decoy TLS site (probe resistance)" \
+      "use / set up existing HOST:PORT" \
+      "I already configured a site (enter HOST:PORT)" \
+      "guided setup now (system Caddy/nginx on loopback)" 
+    case "$decoy_choice" in
+      guided*) SETUP_DECOY=1 ;;
+      *"already"*) prompt DECOY "Decoy HOST:PORT" "127.0.0.1:8443" ;;
+      *) prompt DECOY "Decoy HOST:PORT" "127.0.0.1:8443" ;;
+    esac
   fi
   if [ -z "$DNS_ZONE" ]; then
-    local dz=""
-    prompt dz "DNS carrier zone (empty to skip)" ""
-    DNS_ZONE=$dz
+    menu dns_choice "DNS carrier (UDP/53 protocol tunnel; skip unless you need it)" "off (recommended)" "enable"
+    if [[ "$dns_choice" == enable* ]]; then
+      prompt DNS_ZONE "DNS carrier zone suffix (e.g. carrier.example.com)" ""
+      [ -n "$DNS_ZONE" ] || die "dns zone required when enabling the DNS carrier"
+    fi
   fi
   echo
-  log "summary: mode=$([ "$REGISTER" -eq 1 ] && echo register || echo enroll) decoy=$DECOY listen=${LISTEN:-:443} sni=${SNI:--} dns_zone=${DNS_ZONE:--} control=$CONTROL"
+  log "summary: mode=$([ "$REGISTER" -eq 1 ] && echo register || echo enroll) decoy=${DECOY:-guided} listen=${LISTEN:-:443} sni=${SNI:--} dns_zone=${DNS_ZONE:--} control=$CONTROL"
   local ok=y
   prompt ok "Proceed?" "y"
   case "$ok" in y|Y|yes|YES) ;; *) die "aborted" ;; esac
@@ -245,20 +568,20 @@ ensure_user() {
 }
 
 check_decoy() {
-  [ -n "$DECOY" ] || die "--decoy HOST:PORT is required: point it at your real TLS web server (ADR-015)"
+  [ -n "$DECOY" ] || die "--decoy HOST:PORT is required: point it at your real TLS web server (ADR-015), or pass --setup-decoy"
   printf '%s' "$DECOY" | grep -Eq '^([^:[:space:]]+|\[[0-9a-fA-F:]+\]):[0-9]{1,5}$' || die "--decoy must be HOST:PORT"
-  local host=${DECOY%:*} port=${DECOY##*:}
-  host=${host#[}; host=${host%]}
-  case "$host" in
+  decoy_host_port
+  case "$DECOY_HOST" in
     127.0.0.1|localhost|::1) ;;
-    *) warn "decoy $host is not loopback: probe traffic is replayed to it over the network" ;;
+    *) warn "decoy $DECOY_HOST is not loopback: probe traffic is replayed to it over the network" ;;
   esac
-  if [ "$port" = 443 ] && [ -z "$LISTEN" ]; then
-    case "$host" in 127.*|localhost|::1)
-      die "the relay listens on :443, which includes loopback, so a decoy on $host:443 collides: pass --listen PUBLIC_IP:443 or move the web server to another port" ;;
-    esac
+  check_listen_decoy_collision
+  if [ "$SETUP_DECOY" -eq 1 ] || [ "$NONINTERACTIVE" -eq 0 ]; then
+    validate_decoy_tls
+  else
+    (exec 3<>"/dev/tcp/$DECOY_HOST/$DECOY_PORT") 2>/dev/null \
+      || warn "nothing answers on $DECOY yet: start the web server before the relay, or probes will not get a site"
   fi
-  (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null || warn "nothing answers on $DECOY yet: start the web server before the relay, or probes will not get a site"
 }
 
 pick_admin_port() {
@@ -387,6 +710,10 @@ listen_port() {
 
 do_enroll() {
   ENROLLED=0
+  if [ "$INIT_ONLY" -eq 1 ]; then
+    log "init-only: skipping enroll/register"
+    return 0
+  fi
   if ! grep -q '^trusted_keys: \[\]' "$CONF"; then log "already enrolled"; ENROLLED=1; return; fi
   if [ "$REGISTER" -eq 1 ]; then
     [ -n "$SNI" ] || die "--register needs --sni HOST"
@@ -401,15 +728,15 @@ do_enroll() {
     ENROLLED=1
     return
   fi
-  # Curated enroll only when a token is available (env, stdin, or a tty prompt).
-  # Default --control alone must not fail a non-interactive install.
+  # Curated enroll requires a token unless --init-only.
   if [ -z "${ENROLL_TOKEN:-}" ] && [ "$TOKEN_STDIN" -eq 0 ] && [ ! -r /dev/tty ]; then
-    warn "not enrolled: set ENROLL_TOKEN for curated enroll, or pass --register --sni HOST"
-    return 0
+    die "not enrolled: set ENROLL_TOKEN for curated enroll, pass --register --sni HOST, or --init-only"
   fi
   read_token
   local args=(enroll -config "$CONF" -control "$CONTROL" -token -)
   [ -n "$PIN" ] && args+=(-pin "$PIN")
+  [ -n "$LISTEN" ] && args+=(-addr "$LISTEN")
+  [ -n "$SNI" ] && args+=(-sni "$SNI")
   # The token goes through stdin, never argv. ponytail: the control URL is in argv
   # for the seconds enroll runs (visible to `ps`); it is not stored anywhere.
   printf '%s\n' "$ENROLL_TOKEN" | "$BIN" "${args[@]}"
@@ -488,11 +815,28 @@ case "$ACTION" in
 esac
 
 [ -f "$UNIT_FILE" ] && die "an install named $NAME exists: use --upgrade, or --uninstall first"
-check_decoy
-[ -z "$SNI" ] || [ "$REGISTER" -eq 1 ] || die "--sni needs --register"
+[ -z "$SNI" ] || [ "$REGISTER" -eq 1 ] || true
 [ "$REGISTER" -eq 0 ] || [ -n "$SNI" ] || die "--register needs --sni HOST"
 printf '%s' "$CONTROL" | grep -Eq '^https://' || die "--control must be an https URL"
 [ "$NO_BEAT" -eq 0 ] || [ "$REGISTER" -eq 1 ] || warn "--no-beat only affects community installs that store control_url"
+
+if [ -n "$LISTEN" ]; then validate_listen "$LISTEN"; fi
+if [ -n "$SNI" ]; then check_domain_dns "$SNI"; fi
+check_dns_carrier
+
+if [ "$SETUP_DECOY" -eq 1 ]; then
+  [ -n "$SNI" ] || die "--setup-decoy needs --sni DOMAIN"
+  run_guided_decoy "$SNI"
+fi
+check_decoy
+
+# Non-interactive curated without token must fail unless --init-only.
+if [ "$ACTION" = install ] && [ "$REGISTER" -eq 0 ] && [ "$INIT_ONLY" -eq 0 ] && [ "$NONINTERACTIVE" -eq 1 ]; then
+  if [ -z "${ENROLL_TOKEN:-}" ] && [ "$TOKEN_STDIN" -eq 0 ]; then
+    die "curated install needs ENROLL_TOKEN (or --token-stdin), --register --sni HOST, or --init-only"
+  fi
+fi
+
 install_binary
 # A failure before the service starts (bad token, unreachable control) removes
 # what this run created, so the same command can be retried.
@@ -510,7 +854,9 @@ if [ "$START" -eq 1 ] && [ "$ENROLLED" -eq 1 ]; then
   systemctl is-active --quiet "$NAME.service" || { journalctl -u "$NAME.service" -n 30 --no-pager; die "service failed to start"; }
   log "running"
 else
-  if [ "$ENROLLED" -ne 1 ]; then
+  if [ "$INIT_ONLY" -eq 1 ]; then
+    log "init-only complete: enroll/register then systemctl enable --now $NAME"
+  elif [ "$ENROLLED" -ne 1 ]; then
     if [ "$REGISTER" -eq 1 ]; then
       warn "not registered: $BIN register -config $CONF -control URL -sni HOST   then   systemctl enable --now $NAME"
     else
@@ -525,5 +871,8 @@ ROLLBACK=0
 if [ "$GENERATED_NAME" -eq 1 ]; then
   echo
   log "install name (shown once, needed for --upgrade/--rollback/--uninstall): $NAME"
+fi
+if [ -n "$SNI" ]; then
+  log "domain/sni=$SNI listen=${LISTEN:-:443} decoy=$DECOY"
 fi
 log "done. Follow your host's acceptable-use policy; lowkey reduces fingerprinting and does not make a relay undetectable."

@@ -28,13 +28,13 @@ func TestEnrollPin(t *testing.T) {
 	pub, _, _ := ed25519.GenerateKey(rand.Reader)
 	good := transport.SPKIPin(srv.Certificate())
 
-	if _, err := enroll(context.Background(), u, "t", "", pub); err == nil {
+	if _, err := enroll(context.Background(), u, "t", "", pub, "", ""); err == nil {
 		t.Fatal("self-signed control accepted without pin")
 	}
-	if _, err := enroll(context.Background(), u, "t", "AAAA", pub); err == nil {
+	if _, err := enroll(context.Background(), u, "t", "AAAA", pub, "", ""); err == nil {
 		t.Fatal("wrong pin accepted")
 	}
-	out, err := enroll(context.Background(), u, "t", good, pub)
+	out, err := enroll(context.Background(), u, "t", good, pub, "1.2.3.4:443", "relay.example")
 	if err != nil || len(out.TrustedKeys) != 1 || out.RelayID != "r1" {
 		t.Fatalf("good pin refused: %+v %v", out, err)
 	}
