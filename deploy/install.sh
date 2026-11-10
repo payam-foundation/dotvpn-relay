@@ -145,7 +145,9 @@ menu() { # var prompt options...  (numbered; stores selected value in var)
   case "$_ans" in
     *[!0-9]*|"") die "invalid menu choice" ;;
   esac
-  [ "$_ans" -ge 1 ] && [ "$_ans" -le "$_n" ] || die "invalid menu choice"
+  if [ "$_ans" -lt 1 ] || [ "$_ans" -gt "$_n" ]; then
+    die "invalid menu choice"
+  fi
   printf -v "$_var" '%s' "${_opts[_ans-1]}"
 }
 
@@ -155,7 +157,9 @@ validate_listen() {
   printf '%s' "$a" | grep -Eq '^(\[[0-9a-fA-F:]+\]|[^:[:space:]]*)?:[0-9]{1,5}$' \
     || die "listen must be host:port or :port (got $a); e.g. $(detect_any_ipv4):443 or :443 — not bare 2083"
   local port=${a##*:}
-  [ "$port" -ge 1 ] && [ "$port" -le 65535 ] 2>/dev/null || die "listen port out of range: $port"
+  if ! [ "$port" -ge 1 ] 2>/dev/null || ! [ "$port" -le 65535 ] 2>/dev/null; then
+    die "listen port out of range: $port"
+  fi
 }
 
 listen_includes_loopback() {
