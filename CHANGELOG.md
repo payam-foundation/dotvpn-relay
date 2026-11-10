@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/payam-foundation/dotvpn-relay/compare/v0.8.0...v0.8.1) (2026-11-10)
+
+
+### Bug Fixes
+
+* **deploy:** use df -Pk for disk preflight ([#32](https://github.com/payam-foundation/dotvpn-relay/issues/32)) ([3bc1285](https://github.com/payam-foundation/dotvpn-relay/commit/3bc1285a81245e5d1ecacd4877f0f60225f05a9f))
+
 ## [0.8.0](https://github.com/payam-foundation/dotvpn-relay/compare/v0.7.1...v0.8.0) (2026-11-10)
 
 
