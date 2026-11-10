@@ -10,7 +10,7 @@ Do not open a public issue for a vulnerability. Include the affected version, a 
 
 ## Supported versions
 
-Only the latest tagged release of each repository receives security fixes. A wire major version bump is a coordinated release of every component (see `dotvpn-wire`).
+Only the latest git tag of this repository receives security fixes. Older tags are unsupported. A wire major version bump is a coordinated release of every component (see `dotvpn-wire`).
 
 ## Scope
 

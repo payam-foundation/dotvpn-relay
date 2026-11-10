@@ -71,6 +71,9 @@ func (c *Config) Validate() error {
 	if (c.DNSListen == "") != (c.DNSZone == "") {
 		return errors.New("dns_listen and dns_zone go together")
 	}
+	if c.MaxConns < 0 {
+		return errors.New("max_conns must be >= 0 (0 keeps the default)")
+	}
 	return nil
 }
 
