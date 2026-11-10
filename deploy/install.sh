@@ -10,8 +10,8 @@
 # Interactive (download first so stdin is a TTY):
 #   curl -fsSL …/deploy/install.sh -o install.sh && sudo bash install.sh
 #
-# Flags: --control URL      control API URL (default https://ctrl.dotvpn.org;
-#                           self-hosted: https://YOUR_NODE/dotvpn/api — must mint the token)
+# Flags: --control DOMAIN   control domain (default ctrl.dotvpn.org). Full
+#                           https://…/api URLs are accepted and normalized.
 #        --register         community self-registration (no admin token; needs --sni)
 #        --sni HOST         domain/SNI clients and nodes present (required with --register;
 #                           recommended with curated enroll so control can match)
@@ -42,7 +42,10 @@
 set -euo pipefail
 
 REPO="${RELAY_REPO:-payam-foundation/dotvpn-relay}"
-CONTROL="https://ctrl.dotvpn.org" PIN="" DECOY="" LISTEN="" DNS_ZONE="" SNI="" REGISTER=0 NO_BEAT=0
+CONTROL_DOMAIN="ctrl.dotvpn.org"
+CONTROL_MOUNT="/api"
+CONTROL="https://${CONTROL_DOMAIN}${CONTROL_MOUNT}"
+PIN="" DECOY="" LISTEN="" DNS_ZONE="" SNI="" REGISTER=0 NO_BEAT=0
 LOWKEY=0 NAME="" QUIET=0
 VERSION=latest FROM_DIR="" TOKEN_STDIN=0 ACTION=install START=1 FIREWALL=1
 NONINTERACTIVE=0 PURGE_FW=0 LISTEN_SET=0 REGISTER_SET=0 CONTROL_SET=0
@@ -54,10 +57,21 @@ warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" 2>/dev/null | sed '$d' | sed 's/^# \{0,1\}//' || true; }
 
+# Accepts a bare domain or https URL; always builds https://DOMAIN/api.
+set_control_domain() {
+  local raw host
+  raw=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's|^https\?://||; s|/.*||; s|:.*||; s/[[:space:]]//g')
+  host=$raw
+  printf '%s' "$host" | grep -Eq '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$' \
+    || die "control domain looks invalid: $1 (want example.com)"
+  CONTROL_DOMAIN=$host
+  CONTROL="https://${CONTROL_DOMAIN}${CONTROL_MOUNT}"
+}
+
 need() { [ $# -ge 2 ] || die "$1 needs a value"; }
 while [ $# -gt 0 ]; do
   case "$1" in
-    --control) need "$@"; CONTROL=$2; CONTROL_SET=1; shift 2 ;;
+    --control) need "$@"; set_control_domain "$2"; CONTROL_SET=1; shift 2 ;;
     --register) REGISTER=1; REGISTER_SET=1; shift ;;
     --sni) need "$@"; SNI=$2; shift 2 ;;
     --pin) need "$@"; PIN=$2; shift 2 ;;
@@ -289,7 +303,7 @@ apply_enroll_pending() {
     if [ "$http" = "401" ]; then
       hint=" Token invalid, expired, or already used — create a new relay in core and paste the new token."
     elif [ "$http" = "404" ] || [ "$http" = "000" ] || grep -qi '<html' "$tmp" 2>/dev/null; then
-      hint=" Wrong --control for this token (self-hosted cores use the API mount, e.g. https://YOUR_NODE/dotvpn/api)."
+      hint=" Wrong control domain (API is https://DOMAIN/api; default ctrl.dotvpn.org)."
     fi
     rm -f "$tmp"
     die "could not load pending relay from $url (HTTP ${http}).${hint}"
@@ -320,6 +334,18 @@ for k in ("addr","sni","dns_zone","name"):
     DNS_ZONE=$p_zone
   fi
   log "from enroll token: name=${name:--} listen=$LISTEN domain=$SNI dns_zone=${DNS_ZONE:--}"
+}
+
+check_control_reachable() {
+  local url="${CONTROL%/}/healthz" code body
+  body=$(mktemp)
+  code=$(curl -sS -o "$body" -w '%{http_code}' --max-time 15 "$url" 2>/dev/null || printf '000')
+  if [ "$code" != "200" ] || ! grep -qi '^ok' "$body"; then
+    rm -f "$body"
+    die "control not reachable at $url (HTTP ${code}). Check DNS/TLS for ${CONTROL_DOMAIN} and that core mount is /api"
+  fi
+  rm -f "$body"
+  log "control ok at $CONTROL"
 }
 
 check_dns_carrier() {
@@ -496,12 +522,14 @@ interactive_fill() {
       *) REGISTER=0 ;;
     esac
   fi
-  # Token is bound to the control that minted it. Ask before pending/enroll/register.
+  # Control domain only; API path is always /api on that host.
   if [ "$CONTROL_SET" -eq 0 ]; then
-    printf '%s\n' "Control API URL: production default, or your core mount (e.g. https://node.example/dotvpn/api)." > /dev/tty
-    prompt CONTROL "Control API URL" "$CONTROL"
+    printf '%s\n' "Control domain (API at https://DOMAIN/api). Default is production." > /dev/tty
+    prompt CONTROL_DOMAIN "Control domain" "$CONTROL_DOMAIN"
+    set_control_domain "$CONTROL_DOMAIN"
     CONTROL_SET=1
   fi
+  check_control_reachable
   if [ "$REGISTER" -eq 0 ] && [ "$INIT_ONLY" -eq 0 ]; then
     if [ -z "${ENROLL_TOKEN:-}" ]; then
       printf '%s\n' "On core: Relays → Add (name, public IP, port, domain). Then paste the token below." > /dev/tty
@@ -567,9 +595,12 @@ interactive_fill() {
 }
 
 interactive_fill
-# Non-interactive curated installs also pull listen/domain/dns from the token.
-if [ "$ACTION" = install ] && [ "$NONINTERACTIVE" -eq 1 ] && [ "$REGISTER" -eq 0 ] && [ -n "${ENROLL_TOKEN:-}" ]; then
-  apply_enroll_pending
+# Non-interactive: validate control, then pull listen/domain/dns from the token.
+if [ "$ACTION" = install ] && [ "$NONINTERACTIVE" -eq 1 ]; then
+  check_control_reachable
+  if [ "$REGISTER" -eq 0 ] && [ -n "${ENROLL_TOKEN:-}" ]; then
+    apply_enroll_pending
+  fi
 fi
 
 # Words for a random lowkey name. None may contain a forbidden token.

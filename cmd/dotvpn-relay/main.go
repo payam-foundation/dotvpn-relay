@@ -34,9 +34,9 @@ import (
 
 var version = "dev"
 
-// defaultControlURL is the production control plane (CDN fronted). Operators
-// override with -control for labs and self-hosted cores.
-const defaultControlURL = "https://ctrl.dotvpn.org"
+// defaultControlURL is the production control plane API (CDN fronted).
+// Operators override with -control DOMAIN or a full https URL.
+const defaultControlURL = "https://ctrl.dotvpn.org/api"
 
 // usage takes the program name and the version. Names come from the binary
 // name (see prog), so a renamed binary never prints the project name.
@@ -323,10 +323,21 @@ func controlClient(pin string) *http.Client {
 }
 
 func parseControlURL(raw string) (*url.URL, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, errors.New("-control must be a domain or https URL")
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + strings.TrimSuffix(raw, "/") + "/api"
+	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" || (u.Scheme != "https" && !loopback.IsHost(u.Hostname())) {
-		return nil, errors.New("-control must be an https URL")
+		return nil, errors.New("-control must be a domain or https URL")
 	}
+	if u.Path == "" || u.Path == "/" {
+		u.Path = "/api"
+	}
+	u.Path = strings.TrimSuffix(u.Path, "/")
 	return u, nil
 }
 

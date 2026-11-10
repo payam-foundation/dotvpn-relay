@@ -48,7 +48,7 @@ flowchart LR
 
 ## Quick start
 
-`enroll` and `register` default to the production control plane at `https://ctrl.dotvpn.org` (CDN). Override with `-control` for a self-hosted or lab core. You need either that production control or your own [dotvpn-core](https://github.com/payam-foundation/dotvpn-core).
+`enroll` and `register` default to the production control plane at `https://ctrl.dotvpn.org/api` (CDN). Pass a bare domain (`-control ctrl.dotvpn.org`) or a full URL; bare domains get `/api` appended. You need either that production control or your own [dotvpn-core](https://github.com/payam-foundation/dotvpn-core).
 
 ### Curated (admin token)
 
@@ -111,7 +111,7 @@ curl -fsSL https://raw.githubusercontent.com/payam-foundation/dotvpn-relay/main/
     --decoy 127.0.0.1:8443 --listen <public-ip>:443
 ```
 
-Both default `--control` to `https://ctrl.dotvpn.org`. A curated token must be redeemed against the **same** control that minted it: for a self-hosted core that is usually `--control https://YOUR_NODE/dotvpn/api` (interactive install asks). The enroll token travels by environment or stdin (`enroll -token -`), never argv. Curated non-interactive installs without a token fail unless `--init-only`. `--setup-decoy`, `--require-dns`, `--dns-zone`, `--upgrade`, `--rollback`, `--uninstall` (optional `--purge-firewall`), `--pin`, `--no-beat`, `--from-dir` and `--lowkey` are in `install.sh --help`. A failed enroll/register removes what the install created. The DNS carrier (`--dns-zone`) is off by default; it is a UDP/53 protocol suffix, not normal authoritative DNS hosting.
+Both default `--control` to domain `ctrl.dotvpn.org` (API at `https://ctrl.dotvpn.org/api`). Pass a bare domain; the installer/CLI append `/api`. A curated token must be redeemed against the **same** control that minted it. The enroll token travels by environment or stdin (`enroll -token -`), never argv. Curated non-interactive installs without a token fail unless `--init-only`. `--setup-decoy`, `--require-dns`, `--dns-zone`, `--upgrade`, `--rollback`, `--uninstall` (optional `--purge-firewall`), `--pin`, `--no-beat`, `--from-dir` and `--lowkey` are in `install.sh --help`. A failed enroll/register removes what the install created. The DNS carrier (`--dns-zone`) is off by default; it is a UDP/53 protocol suffix, not normal authoritative DNS hosting.
 
 ### Ports
 
