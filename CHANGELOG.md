@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/payam-foundation/dotvpn-relay/compare/v0.4.0...v0.5.0) (2026-11-10)
+
+
+### Features
+
+* **deploy:** menu installer with guided decoy and domain checks ([#20](https://github.com/payam-foundation/dotvpn-relay/issues/20)) ([1893f75](https://github.com/payam-foundation/dotvpn-relay/commit/1893f75c80c1fa9151810db19521eeb6f97d984c))
+
 ## [0.4.0](https://github.com/payam-foundation/dotvpn-relay/compare/v0.3.0...v0.4.0) (2026-11-10)
 
 
