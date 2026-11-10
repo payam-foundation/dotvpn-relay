@@ -189,6 +189,8 @@ func cmdEnroll(ctx context.Context, args []string) error {
 	ctrl := fs.String("control", defaultControlURL, "control public API URL (https; default "+defaultControlURL+")")
 	token := fs.String("token", "", "one-time enrollment token from the core admin API; \"-\" reads it from stdin")
 	pin := fs.String("pin", "", "base64 SHA-256 SPKI pin of control's TLS key, for a self-signed control")
+	addr := fs.String("addr", "", "public listen host:port to match the pending relay on control")
+	sni := fs.String("sni", "", "domain/SNI to match the pending relay on control")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -212,7 +214,11 @@ func cmdEnroll(ctx context.Context, args []string) error {
 	if err != nil {
 		return errors.New("identity_key invalid: run `" + prog() + " init`")
 	}
-	out, err := enroll(ctx, u, tok, *pin, priv.Public().(ed25519.PublicKey))
+	matchAddr := *addr
+	if matchAddr == "" {
+		matchAddr = c.Listen
+	}
+	out, err := enroll(ctx, u, tok, *pin, priv.Public().(ed25519.PublicKey), matchAddr, *sni)
 	if err != nil {
 		return err
 	}
@@ -228,16 +234,33 @@ func cmdEnroll(ctx context.Context, args []string) error {
 	if out.RelayID != "" {
 		fmt.Println("relay_id:", out.RelayID)
 	}
+	if out.Addr != "" {
+		fmt.Println("addr:", out.Addr)
+	}
+	if out.SNI != "" {
+		fmt.Println("sni:", out.SNI)
+	}
+	if out.DNSZone != "" {
+		fmt.Println("dns_zone:", out.DNSZone)
+	}
 	return nil
 }
 
 type enrollResult struct {
 	RelayID     string
 	TrustedKeys []string
+	Addr        string
+	SNI         string
+	DNSAddr     string
+	DNSZone     string
 }
 
-func enroll(ctx context.Context, base *url.URL, token, pin string, pub ed25519.PublicKey) (enrollResult, error) {
-	body, _ := json.Marshal(map[string]string{"public_key": auth.EncodeKey(pub)})
+func enroll(ctx context.Context, base *url.URL, token, pin string, pub ed25519.PublicKey, addr, sni string) (enrollResult, error) {
+	body, _ := json.Marshal(map[string]string{
+		"public_key": auth.EncodeKey(pub),
+		"addr":       addr,
+		"sni":        sni,
+	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base.JoinPath("/v1/relays/enroll").String(), bytes.NewReader(body))
 	if err != nil {
 		return enrollResult{}, err
@@ -249,17 +272,34 @@ func enroll(ctx context.Context, base *url.URL, token, pin string, pub ed25519.P
 		return enrollResult{}, errors.New("control unreachable")
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict {
+		var er struct {
+			Error string `json:"error"`
+		}
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 512)).Decode(&er)
+		if er.Error == "" {
+			er.Error = "addr/sni does not match pending relay"
+		}
+		return enrollResult{}, fmt.Errorf("enrollment mismatch: %s", er.Error)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return enrollResult{}, fmt.Errorf("enrollment refused (%d)", resp.StatusCode)
 	}
 	var out struct {
 		RelayID     string   `json:"relay_id"`
 		TrustedKeys []string `json:"trusted_keys"`
+		Addr        string   `json:"addr"`
+		SNI         string   `json:"sni"`
+		DNSAddr     string   `json:"dns_addr"`
+		DNSZone     string   `json:"dns_zone"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&out); err != nil || len(out.TrustedKeys) == 0 {
 		return enrollResult{}, errors.New("enrollment response invalid")
 	}
-	return enrollResult{RelayID: out.RelayID, TrustedKeys: out.TrustedKeys}, nil
+	return enrollResult{
+		RelayID: out.RelayID, TrustedKeys: out.TrustedKeys,
+		Addr: out.Addr, SNI: out.SNI, DNSAddr: out.DNSAddr, DNSZone: out.DNSZone,
+	}, nil
 }
 
 func controlClient(pin string) *http.Client {

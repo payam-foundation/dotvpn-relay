@@ -83,9 +83,11 @@ Compose comments cover `init` / `enroll` / `register` against the data volume.
 
 ### Installer (native systemd)
 
-Prefer download → inspect → run. `deploy/install.sh` installs a release under a hardened systemd unit (dedicated user, 0640 config). SHA-256 checks the binary against `checksums.txt`; when `cosign` is on PATH (or `REQUIRE_COSIGN=1`), the installer also verifies `checksums.txt.sigstore.json`. The decoy must be a web server you already run. The relay cannot share `:443` with the decoy: bind to the public address and keep the web server on loopback or another port.
+Prefer download → inspect → run. `deploy/install.sh` installs a release under a hardened systemd unit (dedicated user, 0640 config). SHA-256 checks the binary against `checksums.txt`; when `cosign` is on PATH (or `REQUIRE_COSIGN=1`), the installer also verifies `checksums.txt.sigstore.json`.
 
-**Interactive** (TTY; detects a candidate public IP):
+**Decoy geometry.** The decoy is a real TLS web server you operate (ADR-015). The relay listens on the public address (typically `PUBLIC_IP:443`); the decoy binds loopback (e.g. `127.0.0.1:8443`). They cannot share the same socket. Point DNS A/AAAA for your domain at the relay host with **DNS-only** records — a proxied CDN terminates TLS and breaks the knock. Interactive install can reuse an existing nginx/Caddy or run `--setup-decoy` to install a system Caddy/nginx for your domain (never embedded in the relay binary).
+
+**Interactive** (TTY; menus for mode, listen, decoy, DNS carrier; asks for the enroll token *before* download):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/payam-foundation/dotvpn-relay/main/deploy/install.sh -o install.sh
@@ -93,23 +95,23 @@ curl -fsSL https://raw.githubusercontent.com/payam-foundation/dotvpn-relay/main/
 sudo bash install.sh
 ```
 
-**Curated (non-interactive):**
+**Curated (non-interactive):** create the relay in core first (`dvadmin` Relays → Add, or `dvadmin relays add NAME HOST:PORT DOMAIN`), then:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/payam-foundation/dotvpn-relay/main/deploy/install.sh \
   | sudo ENROLL_TOKEN=<one-time token> bash -s -- \
-    --decoy 127.0.0.1:8443 --listen <public-ip>:443
+    --decoy 127.0.0.1:8443 --listen <public-ip>:443 --sni relay.example.com
 ```
 
 **Community (non-interactive):**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/payam-foundation/dotvpn-relay/main/deploy/install.sh \
-  | sudo bash -s -- --register --sni cdn.example.com \
+  | sudo bash -s -- --register --sni relay.example.com \
     --decoy 127.0.0.1:8443 --listen <public-ip>:443
 ```
 
-Both default `--control` to `https://ctrl.dotvpn.org`. The enroll token travels by environment or stdin (`enroll -token -`), never argv. `--upgrade`, `--rollback`, `--uninstall` (optional `--purge-firewall`), `--dns-zone`, `--pin`, `--no-beat`, `--from-dir` and `--lowkey` are in `install.sh --help`. A failed enroll/register removes what the install created.
+Both default `--control` to `https://ctrl.dotvpn.org`. The enroll token travels by environment or stdin (`enroll -token -`), never argv. Curated non-interactive installs without a token fail unless `--init-only`. `--setup-decoy`, `--require-dns`, `--dns-zone`, `--upgrade`, `--rollback`, `--uninstall` (optional `--purge-firewall`), `--pin`, `--no-beat`, `--from-dir` and `--lowkey` are in `install.sh --help`. A failed enroll/register removes what the install created. The DNS carrier (`--dns-zone`) is off by default; it is a UDP/53 protocol suffix, not normal authoritative DNS hosting.
 
 ### Ports
 
@@ -132,9 +134,10 @@ This lowers fingerprinting by scanners and casual inspection. It does not make a
 
 ### Production guidance
 
-- **Use a real decoy.** Point `-decoy` at a stock nginx or Caddy with a real certificate for a plausible domain. It should send no HTTP/3 `alt-svc` (the relay is TCP-only), keep its own `Server` header and error pages, and have no admin API. The built-in decoy (`-tls-cert`, `-tls-key`) exists for tests.
+- **Use a real decoy.** Point `-decoy` at a stock nginx or Caddy with a real certificate for a plausible domain (any geography; no software geo-check). It should send no HTTP/3 `alt-svc` (the relay is TCP-only), keep its own `Server` header and error pages, and have no admin API. The built-in decoy (`-tls-cert`, `-tls-key`) exists for tests. Installer `--setup-decoy` can provision a system Caddy/nginx on loopback for your domain.
+- **Domain / SNI.** Clients and nodes present your domain as SNI. DNS must point at this host without a proxied CDN in front of the relay.
 - **One relay, many nodes.** Each node parks its own tunnels, keyed by node ID. Give each user cohort its own relay set, so revoking one relay does not affect the others.
-- **DNS carrier.** Add `-dns-listen` and `-dns-zone` to `init` to enable it. They go together.
+- **DNS carrier.** Optional. Add `-dns-listen` and `-dns-zone` to `init` (or installer `--dns-zone`) to enable it. They go together; the installer refuses if UDP/53 is already taken.
 - **Community visibility.** Self-registered relays start `public=false`; an admin promotes them with `PATCH /v1/admin/relays/{id}` (`public: true`). They must beat about every 30–45s or they leave node pools after ~90s.
 
 Rationale and residual risks: [ADR-015](docs/adr/015-relay-operational-exposure.md).
