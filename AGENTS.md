@@ -22,7 +22,7 @@ go test -race -count=1 ./...
 ## Shared rules
 
 - Static builds: `CGO_ENABLED=0`, `-trimpath`. Docker base images pinned by digest, distroless, non-root.
-- Secrets never go in the repo, unit files, env files or CI. Keys are written 0600/0640.
+- Secrets never go in the repo, unit files, env files or CI. Config files are written 0640 (root-owned, service group readable).
 - Go style: stdlib first, no new dependency for what a few lines do, no placeholder code. Mark deliberate shortcuts with a `ponytail:` comment naming the ceiling and the upgrade path.
 - Each repo is its own git repo and Go module. Sibling repos live next to this one; do not import across core, relay and client. Anything two of them must agree on goes in `dotvpn-wire`.
 

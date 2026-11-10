@@ -442,6 +442,9 @@ func serve(ctx context.Context, c *config.Config, beat bool) error {
 	go func() { <-ctx.Done(); _ = hs.Close() }()
 	go func() { _ = hs.Serve(adm) }()
 	if beat && c.ControlURL != "" && c.RelayID != "" {
+		if _, err := parseControlURL(c.ControlURL); err != nil {
+			return fmt.Errorf("control_url: %w", err)
+		}
 		go beatLoop(ctx, c, priv, srv, log)
 	}
 	log.Info("started")
@@ -454,8 +457,9 @@ func serve(ctx context.Context, c *config.Config, beat bool) error {
 }
 
 func beatLoop(ctx context.Context, c *config.Config, priv ed25519.PrivateKey, srv *relay.Server, log *slog.Logger) {
-	base, err := url.Parse(c.ControlURL)
+	base, err := parseControlURL(c.ControlURL)
 	if err != nil {
+		log.Warn("beat disabled: control_url invalid", "err", err)
 		return
 	}
 	pub := auth.EncodeKey(priv.Public().(ed25519.PublicKey))

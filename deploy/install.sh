@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
-# Relay installer (native systemd). Usage:
-#   # Curated (admin token; control URL used once, not stored):
-#   curl -fsSL https://raw.githubusercontent.com/payam-foundation/dotvpn-relay/main/deploy/install.sh \
-#     | sudo ENROLL_TOKEN=... bash -s -- --decoy 127.0.0.1:8443 --lowkey
-#   # Community (open self-registration; stores control URL for optional beats):
-#   curl -fsSL https://raw.githubusercontent.com/payam-foundation/dotvpn-relay/main/deploy/install.sh \
-#     | sudo bash -s -- --register --sni cdn.example.com \
-#         --decoy 127.0.0.1:8443 --listen PUBLIC_IP:443
+# Relay installer (native systemd).
+#
+# Non-interactive (safe for curl|bash; pass all required flags):
+#   curl -fsSL …/deploy/install.sh | sudo ENROLL_TOKEN=… bash -s -- \
+#     --decoy 127.0.0.1:8443 --listen PUBLIC_IP:443
+#   curl -fsSL …/deploy/install.sh | sudo bash -s -- --register --sni cdn.example.com \
+#     --decoy 127.0.0.1:8443 --listen PUBLIC_IP:443
+#
+# Interactive (download first so stdin is a TTY):
+#   curl -fsSL …/deploy/install.sh -o install.sh && sudo bash install.sh
 #
 # Flags: --control URL      control API URL (default https://ctrl.dotvpn.org)
 #        --register         community self-registration (no admin token; needs --sni)
 #        --sni HOST         SNI clients and nodes present (required with --register)
 #        --pin PIN          base64 SHA-256 SPKI pin for a self-signed control
 #        --decoy HOST:PORT  your real TLS web server (required)
-#        --listen ADDR      public listen address (default :443)
+#        --listen ADDR      public listen address (default: detected PUBLIC_IP:443 interactively, else :443)
 #        --dns-zone Z       enable the DNS carrier on :53 for zone Z (off by default)
 #        --lowkey           neutral build; every name derives from --name (see ADR-016)
 #        --name N           lowkey install name (random if omitted, printed at the end)
@@ -22,18 +24,21 @@
 #        --version vX.Y.Z   release to install (default latest)
 #        --from-dir DIR     use binaries and checksums.txt from DIR instead of downloading
 #        --token-stdin      read the enrollment token from stdin (else ENROLL_TOKEN, else a prompt)
+#        --non-interactive  never prompt (implied when stdin is not a TTY or CI is set)
+#        --purge-firewall   with --uninstall, also remove ports this installer opened
 #        --upgrade | --rollback | --uninstall | --no-start | --no-firewall
+# Prefer: download the script, inspect it, then run. Checksums authenticate the
+# binary only relative to checksums.txt; when cosign is installed (or
+# REQUIRE_COSIGN=1), the installer verifies checksums.txt.sigstore.json.
 # Upgrade, rollback and uninstall need the same --lowkey/--name as the install.
-# Default control is https://ctrl.dotvpn.org (CDN). Override with --control for labs.
 # Curated enroll never stores --control. Community --register stores it for beats.
-# Lowkey lowers fingerprinting. It does not make a relay undetectable and does
-# not override your host's terms: read and follow its acceptable-use policy.
 set -euo pipefail
 
 REPO="${RELAY_REPO:-payam-foundation/dotvpn-relay}"
 CONTROL="https://ctrl.dotvpn.org" PIN="" DECOY="" LISTEN="" DNS_ZONE="" SNI="" REGISTER=0 NO_BEAT=0
 LOWKEY=0 NAME="" QUIET=0
 VERSION=latest FROM_DIR="" TOKEN_STDIN=0 ACTION=install START=1 FIREWALL=1
+NONINTERACTIVE=0 PURGE_FW=0 LISTEN_SET=0 REGISTER_SET=0
 
 log() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
@@ -44,11 +49,11 @@ need() { [ $# -ge 2 ] || die "$1 needs a value"; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --control) need "$@"; CONTROL=$2; shift 2 ;;
-    --register) REGISTER=1; shift ;;
+    --register) REGISTER=1; REGISTER_SET=1; shift ;;
     --sni) need "$@"; SNI=$2; shift 2 ;;
     --pin) need "$@"; PIN=$2; shift 2 ;;
     --decoy) need "$@"; DECOY=$2; shift 2 ;;
-    --listen) need "$@"; LISTEN=$2; shift 2 ;;
+    --listen) need "$@"; LISTEN=$2; LISTEN_SET=1; shift 2 ;;
     --dns-zone) need "$@"; DNS_ZONE=$2; shift 2 ;;
     --lowkey) LOWKEY=1; shift ;;
     --name) need "$@"; NAME=$2; shift 2 ;;
@@ -57,6 +62,8 @@ while [ $# -gt 0 ]; do
     --version) need "$@"; VERSION=$2; shift 2 ;;
     --from-dir) need "$@"; FROM_DIR=$2; shift 2 ;;
     --token-stdin) TOKEN_STDIN=1; shift ;;
+    --non-interactive) NONINTERACTIVE=1; shift ;;
+    --purge-firewall) PURGE_FW=1; shift ;;
     --upgrade) ACTION=upgrade; shift ;;
     --rollback) ACTION=rollback; shift ;;
     --uninstall) ACTION=uninstall; shift ;;
@@ -70,6 +77,76 @@ done
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo)"
 [ "$(uname -s)" = Linux ] || die "the installer supports Linux only"
 command -v systemctl >/dev/null || die "systemd is required (use Docker for a standard install without it)"
+
+# Piped curl|bash has non-TTY stdin — never prompt.
+if [ ! -t 0 ] || [ -n "${CI:-}" ]; then
+  NONINTERACTIVE=1
+fi
+
+detect_public_ip() {
+  local ip=""
+  if command -v ip >/dev/null; then
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')
+  fi
+  if [ -z "$ip" ] && command -v hostname >/dev/null; then
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  fi
+  case "$ip" in
+    ""|127.*|10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|169.254.*) printf '' ;;
+    *) printf '%s' "$ip" ;;
+  esac
+}
+
+prompt() { # var prompt default
+  local _var=$1 _p=$2 _d=${3:-} _ans=""
+  if [ -r /dev/tty ]; then
+    if [ -n "$_d" ]; then printf '%s [%s]: ' "$_p" "$_d" > /dev/tty
+    else printf '%s: ' "$_p" > /dev/tty; fi
+    IFS= read -r _ans < /dev/tty || true
+  fi
+  [ -n "$_ans" ] || _ans=$_d
+  printf -v "$_var" '%s' "$_ans"
+}
+
+interactive_fill() {
+  [ "$ACTION" = install ] || return 0
+  [ "$NONINTERACTIVE" -eq 0 ] || return 0
+  local mode="enroll" cand=""
+  if [ "$REGISTER_SET" -eq 0 ]; then
+    prompt mode "Mode: enroll (curated token) or register (community)" "enroll"
+    case "$mode" in
+      register|community) REGISTER=1 ;;
+      enroll|curated|"") REGISTER=0 ;;
+      *) die "mode must be enroll or register" ;;
+    esac
+  fi
+  if [ -z "$DECOY" ]; then
+    prompt DECOY "Decoy TLS web server HOST:PORT" "127.0.0.1:8443"
+  fi
+  if [ "$LISTEN_SET" -eq 0 ]; then
+    cand=$(detect_public_ip)
+    if [ -n "$cand" ]; then
+      prompt LISTEN "Public listen address" "${cand}:443"
+    else
+      prompt LISTEN "Public listen address (host:port; avoid bare :443 if decoy is on loopback:443)" ""
+    fi
+  fi
+  if [ "$REGISTER" -eq 1 ] && [ -z "$SNI" ]; then
+    prompt SNI "SNI clients and nodes present" ""
+  fi
+  if [ -z "$DNS_ZONE" ]; then
+    local dz=""
+    prompt dz "DNS carrier zone (empty to skip)" ""
+    DNS_ZONE=$dz
+  fi
+  echo
+  log "summary: mode=$([ "$REGISTER" -eq 1 ] && echo register || echo enroll) decoy=$DECOY listen=${LISTEN:-:443} sni=${SNI:--} dns_zone=${DNS_ZONE:--} control=$CONTROL"
+  local ok=y
+  prompt ok "Proceed?" "y"
+  case "$ok" in y|Y|yes|YES) ;; *) die "aborted" ;; esac
+}
+
+interactive_fill
 
 # Words for a random lowkey name. None may contain a forbidden token.
 WORDS=(amber birch cedar dune ember fjord grove harbor iris juniper kelp lumen maple nectar olive pebble quartz reed slate tundra)
@@ -112,6 +189,27 @@ fetch() { # url dest
   else die "curl or wget required"; fi
 }
 
+verify_checksums_cosign() { # dir with checksums.txt (+ optional .sigstore.json)
+  local dir=$1 base want_cosign=0
+  if command -v cosign >/dev/null; then want_cosign=1; fi
+  [ "${REQUIRE_COSIGN:-0}" = 1 ] && want_cosign=1
+  [ "$want_cosign" -eq 1 ] || return 0
+  command -v cosign >/dev/null || die "REQUIRE_COSIGN=1 but cosign is not installed"
+  if [ ! -f "$dir/checksums.txt.sigstore.json" ]; then
+    if [ -n "$FROM_DIR" ]; then
+      die "checksums.txt.sigstore.json missing in --from-dir (required when cosign is available or REQUIRE_COSIGN=1)"
+    fi
+    if [ "$VERSION" = latest ]; then base="https://github.com/$REPO/releases/latest/download"
+    else base="https://github.com/$REPO/releases/download/$VERSION"; fi
+    fetch "$base/checksums.txt.sigstore.json" "$dir/checksums.txt.sigstore.json"
+  fi
+  log "verifying checksums.txt with cosign"
+  cosign verify-blob --bundle "$dir/checksums.txt.sigstore.json" \
+    --certificate-identity-regexp "https://github.com/$REPO/" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    "$dir/checksums.txt" >/dev/null
+}
+
 install_binary() {
   local tmp a name base want got
   tmp=$(mktemp -d); trap 'rm -rf "$tmp"' RETURN
@@ -119,6 +217,7 @@ install_binary() {
   if [ -n "$FROM_DIR" ]; then
     cp "$FROM_DIR/$name" "$tmp/bin"
     [ -f "$FROM_DIR/checksums.txt" ] && cp "$FROM_DIR/checksums.txt" "$tmp/checksums.txt"
+    [ -f "$FROM_DIR/checksums.txt.sigstore.json" ] && cp "$FROM_DIR/checksums.txt.sigstore.json" "$tmp/checksums.txt.sigstore.json"
   else
     if [ "$VERSION" = latest ]; then base="https://github.com/$REPO/releases/latest/download"
     else base="https://github.com/$REPO/releases/download/$VERSION"; fi
@@ -126,16 +225,12 @@ install_binary() {
     fetch "$base/$name" "$tmp/bin"
     fetch "$base/checksums.txt" "$tmp/checksums.txt"
   fi
-  # ponytail: sha256 against checksums.txt only; verify checksums.txt itself with
-  # cosign (README "Verify a release") when the download channel is not trusted.
-  if [ -f "$tmp/checksums.txt" ]; then
-    want=$(awk -v n="$name" '$2==n {print $1}' "$tmp/checksums.txt")
-    [ -n "$want" ] || die "no checksum for $name"
-    got=$(sha256sum "$tmp/bin" | awk '{print $1}')
-    [ "$want" = "$got" ] || die "checksum mismatch for $name"
-  else
-    die "checksums.txt missing: refusing to install an unverified binary"
-  fi
+  [ -f "$tmp/checksums.txt" ] || die "checksums.txt missing: refusing to install an unverified binary"
+  verify_checksums_cosign "$tmp"
+  want=$(awk -v n="$name" '$2==n {print $1}' "$tmp/checksums.txt")
+  [ -n "$want" ] || die "no checksum for $name"
+  got=$(sha256sum "$tmp/bin" | awk '{print $1}')
+  [ "$want" = "$got" ] || die "checksum mismatch for $name"
   chmod 0755 "$tmp/bin"
   "$tmp/bin" version >/dev/null || die "binary does not run on this host"
   [ -f "$BIN" ] && cp -f "$BIN" "$BIN.prev"
@@ -231,11 +326,31 @@ open_ports() {
   if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
     ufw allow "$port/tcp" >/dev/null
     [ -n "$DNS_ZONE" ] && ufw allow 53/udp >/dev/null
-    log "opened $port/tcp${DNS_ZONE:+ and 53/udp} in ufw (uninstall does not remove firewall rules)"
+    printf '%s\n' "$port/tcp" ${DNS_ZONE:+53/udp} >"$CONF_DIR/firewall.ports"
+    log "opened $port/tcp${DNS_ZONE:+ and 53/udp} in ufw (uninstall keeps rules unless --purge-firewall)"
   elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
     firewall-cmd -q --permanent --add-port="$port/tcp" ${DNS_ZONE:+--add-port=53/udp} && firewall-cmd -q --reload
-    log "opened $port/tcp${DNS_ZONE:+ and 53/udp} in firewalld (uninstall does not remove firewall rules)"
+    printf '%s\n' "$port/tcp" ${DNS_ZONE:+53/udp} >"$CONF_DIR/firewall.ports"
+    log "opened $port/tcp${DNS_ZONE:+ and 53/udp} in firewalld (uninstall keeps rules unless --purge-firewall)"
+  else
+    warn "no active ufw/firewalld: ensure $port/tcp${DNS_ZONE:+ and 53/udp} are reachable on the host/provider firewall"
   fi
+}
+
+purge_firewall() {
+  local ports_file="$CONF_DIR/firewall.ports" p
+  [ -f "$ports_file" ] || { warn "no $ports_file: nothing to purge"; return 0; }
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    if command -v ufw >/dev/null; then ufw delete allow "$p" >/dev/null 2>&1 || true; fi
+    if command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
+      firewall-cmd -q --permanent --remove-port="$p" || true
+    fi
+  done <"$ports_file"
+  if command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd -q --reload || true
+  fi
+  log "purged firewall ports listed in $ports_file"
 }
 
 do_init() {
@@ -349,8 +464,13 @@ remove_install() {
 case "$ACTION" in
   uninstall)
     [ -f "$UNIT_FILE" ] || [ -d "$CONF_DIR" ] || id "$NAME" >/dev/null 2>&1 || die "no install named $NAME"
+    if [ "$PURGE_FW" -eq 1 ]; then purge_firewall; fi
     remove_install
-    log "removed $NAME: unit, binary, config and identity key, user. Revoke the relay at control (DELETE /v1/admin/relays/{id}). Firewall rules, if added, remain."
+    if [ "$PURGE_FW" -eq 1 ]; then
+      log "removed $NAME and purged recorded firewall ports. Revoke the relay at control (DELETE /v1/admin/relays/{id})."
+    else
+      log "removed $NAME: unit, binary, config and identity key, user. Revoke the relay at control (DELETE /v1/admin/relays/{id}). Firewall rules remain unless you re-run with --purge-firewall before uninstall (ports file is removed with config)."
+    fi
     exit 0 ;;
   rollback)
     [ -f "$BIN.prev" ] || die "no previous version at $BIN.prev"

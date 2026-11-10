@@ -83,9 +83,17 @@ Compose comments cover `init` / `enroll` / `register` against the data volume.
 
 ### Installer (native systemd)
 
-`deploy/install.sh` installs a checksum-verified release under a hardened systemd unit, with a dedicated user and a 0640 config. The decoy is yours: it must point at a web server you already run. The relay cannot share `:443` with the decoy: bind the relay to the public address and keep the web server on loopback or another port.
+Prefer download → inspect → run. `deploy/install.sh` installs a release under a hardened systemd unit (dedicated user, 0640 config). SHA-256 checks the binary against `checksums.txt`; when `cosign` is on PATH (or `REQUIRE_COSIGN=1`), the installer also verifies `checksums.txt.sigstore.json`. The decoy must be a web server you already run. The relay cannot share `:443` with the decoy: bind to the public address and keep the web server on loopback or another port.
 
-**Curated:**
+**Interactive** (TTY; detects a candidate public IP):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/payam-foundation/dotvpn-relay/main/deploy/install.sh -o install.sh
+# review install.sh, then:
+sudo bash install.sh
+```
+
+**Curated (non-interactive):**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/payam-foundation/dotvpn-relay/main/deploy/install.sh \
@@ -93,7 +101,7 @@ curl -fsSL https://raw.githubusercontent.com/payam-foundation/dotvpn-relay/main/
     --decoy 127.0.0.1:8443 --listen <public-ip>:443
 ```
 
-**Community:**
+**Community (non-interactive):**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/payam-foundation/dotvpn-relay/main/deploy/install.sh \
@@ -101,7 +109,15 @@ curl -fsSL https://raw.githubusercontent.com/payam-foundation/dotvpn-relay/main/
     --decoy 127.0.0.1:8443 --listen <public-ip>:443
 ```
 
-Both default `--control` to `https://ctrl.dotvpn.org`. The enroll token travels by environment or stdin (`enroll -token -`), never argv. `--upgrade`, `--rollback`, `--uninstall`, `--dns-zone`, `--pin`, `--no-beat`, `--from-dir` and `--lowkey` are in `install.sh --help`. A failed enroll/register removes what the install created.
+Both default `--control` to `https://ctrl.dotvpn.org`. The enroll token travels by environment or stdin (`enroll -token -`), never argv. `--upgrade`, `--rollback`, `--uninstall` (optional `--purge-firewall`), `--dns-zone`, `--pin`, `--no-beat`, `--from-dir` and `--lowkey` are in `install.sh --help`. A failed enroll/register removes what the install created.
+
+### Ports
+
+| Mode | TCP | UDP |
+|---|---|---|
+| Native systemd | listen port (default 443) | 53 only with `--dns-zone` |
+| Docker Compose | `443:443/tcp` | uncomment `53:53/udp` when `dns_listen`/`dns_zone` are set |
+| Admin/metrics | loopback only (default `127.0.0.1:9101`) | — |
 
 ### Lowkey install
 
@@ -119,7 +135,7 @@ This lowers fingerprinting by scanners and casual inspection. It does not make a
 - **Use a real decoy.** Point `-decoy` at a stock nginx or Caddy with a real certificate for a plausible domain. It should send no HTTP/3 `alt-svc` (the relay is TCP-only), keep its own `Server` header and error pages, and have no admin API. The built-in decoy (`-tls-cert`, `-tls-key`) exists for tests.
 - **One relay, many nodes.** Each node parks its own tunnels, keyed by node ID. Give each user cohort its own relay set, so revoking one relay does not affect the others.
 - **DNS carrier.** Add `-dns-listen` and `-dns-zone` to `init` to enable it. They go together.
-- **Community visibility.** Self-registered relays start private; an admin can mark them public. Clients discover them via `GET /v1/relays?ids=` or the curated public list after promotion.
+- **Community visibility.** Self-registered relays start `public=false`; an admin promotes them with `PATCH /v1/admin/relays/{id}` (`public: true`). They must beat about every 30–45s or they leave node pools after ~90s.
 
 Rationale and residual risks: [ADR-015](docs/adr/015-relay-operational-exposure.md).
 
