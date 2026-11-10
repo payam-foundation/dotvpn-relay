@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/payam-foundation/dotvpn-relay/compare/v0.7.0...v0.7.1) (2026-11-10)
+
+
+### Bug Fixes
+
+* **deploy:** strip whitespace from enroll token paste ([#28](https://github.com/payam-foundation/dotvpn-relay/issues/28)) ([8a289e0](https://github.com/payam-foundation/dotvpn-relay/commit/8a289e03d4fbcbafbb94d867e211869c228ba4e9))
+
 ## [0.7.0](https://github.com/payam-foundation/dotvpn-relay/compare/v0.6.1...v0.7.0) (2026-11-10)
 
 
