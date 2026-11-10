@@ -87,7 +87,7 @@ Prefer download → inspect → run. `deploy/install.sh` installs a release unde
 
 **Decoy geometry.** The decoy is a real TLS web server you operate (ADR-015). The relay listens on the public address (typically `PUBLIC_IP:443`); the decoy binds loopback (e.g. `127.0.0.1:8443`). They cannot share the same socket. Point DNS A/AAAA for your domain at the relay host with **DNS-only** records — a proxied CDN terminates TLS and breaks the knock. Interactive install can reuse an existing nginx/Caddy or run `--setup-decoy` to install a system Caddy/nginx for your domain (never embedded in the relay binary).
 
-**Interactive** (TTY; menus for mode, listen, decoy, DNS carrier; asks for the enroll token *before* download):
+**Interactive** (TTY; curated asks for the enroll token first and loads listen/domain/DNS from control so those prompts are skipped; community shows this host’s IP then asks domain/listen; decoy always; DNS carrier under Advanced):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/payam-foundation/dotvpn-relay/main/deploy/install.sh -o install.sh
@@ -95,12 +95,12 @@ curl -fsSL https://raw.githubusercontent.com/payam-foundation/dotvpn-relay/main/
 sudo bash install.sh
 ```
 
-**Curated (non-interactive):** create the relay in core first (`dvadmin` Relays → Add, or `dvadmin relays add NAME HOST:PORT DOMAIN`), then:
+**Curated (non-interactive):** create the relay in core first (`dvadmin` Relays → Add), then paste the token. `GET /v1/relays/enroll/pending` fills listen/domain/DNS when omitted; decoy is still required:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/payam-foundation/dotvpn-relay/main/deploy/install.sh \
   | sudo ENROLL_TOKEN=<one-time token> bash -s -- \
-    --decoy 127.0.0.1:8443 --listen <public-ip>:443 --sni relay.example.com
+    --decoy 127.0.0.1:8443
 ```
 
 **Community (non-interactive):**
