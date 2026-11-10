@@ -10,7 +10,8 @@
 # Interactive (download first so stdin is a TTY):
 #   curl -fsSL …/deploy/install.sh -o install.sh && sudo bash install.sh
 #
-# Flags: --control URL      control API URL (default https://ctrl.dotvpn.org)
+# Flags: --control URL      control API URL (default https://ctrl.dotvpn.org;
+#                           self-hosted: https://YOUR_NODE/dotvpn/api — must mint the token)
 #        --register         community self-registration (no admin token; needs --sni)
 #        --sni HOST         domain/SNI clients and nodes present (required with --register;
 #                           recommended with curated enroll so control can match)
@@ -44,7 +45,7 @@ REPO="${RELAY_REPO:-payam-foundation/dotvpn-relay}"
 CONTROL="https://ctrl.dotvpn.org" PIN="" DECOY="" LISTEN="" DNS_ZONE="" SNI="" REGISTER=0 NO_BEAT=0
 LOWKEY=0 NAME="" QUIET=0
 VERSION=latest FROM_DIR="" TOKEN_STDIN=0 ACTION=install START=1 FIREWALL=1
-NONINTERACTIVE=0 PURGE_FW=0 LISTEN_SET=0 REGISTER_SET=0
+NONINTERACTIVE=0 PURGE_FW=0 LISTEN_SET=0 REGISTER_SET=0 CONTROL_SET=0
 SETUP_DECOY=0 REQUIRE_DNS=0 INIT_ONLY=0
 DECOY_SITE_ROOT=""
 
@@ -56,7 +57,7 @@ usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" 2>/dev/null | sed '$d' | s
 need() { [ $# -ge 2 ] || die "$1 needs a value"; }
 while [ $# -gt 0 ]; do
   case "$1" in
-    --control) need "$@"; CONTROL=$2; shift 2 ;;
+    --control) need "$@"; CONTROL=$2; CONTROL_SET=1; shift 2 ;;
     --register) REGISTER=1; REGISTER_SET=1; shift ;;
     --sni) need "$@"; SNI=$2; shift 2 ;;
     --pin) need "$@"; PIN=$2; shift 2 ;;
@@ -280,10 +281,21 @@ apply_enroll_pending() {
   [ -n "${ENROLL_TOKEN:-}" ] || return 0
   command -v curl >/dev/null || die "curl is required to load pending relay metadata from the enroll token"
   command -v python3 >/dev/null || die "python3 is required to parse pending relay metadata from control"
-  local url="${CONTROL%/}/v1/relays/enroll/pending" json parsed p_addr p_sni p_zone name
-  if ! json=$(curl -fsS --max-time 20 -H "Authorization: Bearer ${ENROLL_TOKEN}" -H "Accept: application/json" "$url" 2>/dev/null); then
-    die "could not load pending relay from token (expired, already used, wrong --control, or network). Re-create the relay in core if needed"
+  local url="${CONTROL%/}/v1/relays/enroll/pending" tmp http json parsed p_addr p_sni p_zone name hint=""
+  tmp=$(mktemp)
+  http=$(curl -sS -o "$tmp" -w '%{http_code}' --max-time 20 \
+    -H "Authorization: Bearer ${ENROLL_TOKEN}" -H "Accept: application/json" "$url" 2>/dev/null || printf '000')
+  if [ "$http" != "200" ]; then
+    if [ "$http" = "401" ]; then
+      hint=" Token invalid, expired, or already used — create a new relay in core and paste the new token."
+    elif [ "$http" = "404" ] || [ "$http" = "000" ] || grep -qi '<html' "$tmp" 2>/dev/null; then
+      hint=" Wrong --control for this token (self-hosted cores use the API mount, e.g. https://YOUR_NODE/dotvpn/api)."
+    fi
+    rm -f "$tmp"
+    die "could not load pending relay from $url (HTTP ${http}).${hint}"
   fi
+  json=$(cat "$tmp")
+  rm -f "$tmp"
   parsed=$(printf '%s' "$json" | python3 -c 'import json,sys
 d=json.load(sys.stdin)
 for k in ("addr","sni","dns_zone","name"):
@@ -483,6 +495,12 @@ interactive_fill() {
       abort*) die "aborted" ;;
       *) REGISTER=0 ;;
     esac
+  fi
+  # Token is bound to the control that minted it. Ask before pending/enroll/register.
+  if [ "$CONTROL_SET" -eq 0 ]; then
+    printf '%s\n' "Control API URL: production default, or your core mount (e.g. https://node.example/dotvpn/api)." > /dev/tty
+    prompt CONTROL "Control API URL" "$CONTROL"
+    CONTROL_SET=1
   fi
   if [ "$REGISTER" -eq 0 ] && [ "$INIT_ONLY" -eq 0 ]; then
     if [ -z "${ENROLL_TOKEN:-}" ]; then
