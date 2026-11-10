@@ -294,13 +294,19 @@ for k in ("addr","sni","dns_zone","name"):
     IFS= read -r p_zone
     IFS= read -r name
   } <<< "$parsed"
-  [ -n "$p_addr" ] && [ -n "$p_sni" ] || die "pending relay response missing addr/sni from $url"
+  if [ -z "$p_addr" ] || [ -z "$p_sni" ]; then
+    die "pending relay response missing addr/sni from $url"
+  fi
   if [ "$LISTEN_SET" -eq 0 ] || [ -z "$LISTEN" ]; then
     LISTEN=$p_addr
     LISTEN_SET=1
   fi
-  [ -z "$SNI" ] && SNI=$p_sni
-  [ -z "$DNS_ZONE" ] && [ -n "$p_zone" ] && DNS_ZONE=$p_zone
+  if [ -z "$SNI" ]; then
+    SNI=$p_sni
+  fi
+  if [ -z "$DNS_ZONE" ] && [ -n "$p_zone" ]; then
+    DNS_ZONE=$p_zone
+  fi
   log "from enroll token: name=${name:--} listen=$LISTEN domain=$SNI dns_zone=${DNS_ZONE:--}"
 }
 
