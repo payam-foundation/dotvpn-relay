@@ -30,6 +30,12 @@
 #        --from-dir DIR     use binaries and checksums.txt from DIR instead of downloading
 #        --token-stdin      read the enrollment token from stdin (else ENROLL_TOKEN, else a prompt)
 #        --non-interactive  never prompt (implied when stdin is not a TTY or CI is set)
+#        --fix-resolved    disable systemd-resolved DNSStubListener (free UDP/53)
+#        --skip-dns-carrier clear dns_zone when UDP/53 conflicts (non-interactive)
+#        --create-swap      create a 1GiB /swapfile when none exists
+#        --no-swap          do not create swap (default in non-interactive)
+#        --setup-firewall   enable ufw (if present) and open relay ports
+#        --setup-fail2ban   install fail2ban with SSH jail only (not 443)
 #        --purge-firewall   with --uninstall, also remove ports this installer opened
 #        --upgrade | --rollback | --uninstall | --no-start | --no-firewall
 # Prefer: download the script, inspect it, then run. Checksums authenticate the
@@ -50,6 +56,8 @@ LOWKEY=0 NAME="" QUIET=0
 VERSION=latest FROM_DIR="" TOKEN_STDIN=0 ACTION=install START=1 FIREWALL=1
 NONINTERACTIVE=0 PURGE_FW=0 LISTEN_SET=0 REGISTER_SET=0 CONTROL_SET=0
 SETUP_DECOY=0 REQUIRE_DNS=0 INIT_ONLY=0
+FIX_RESOLVED=0 SKIP_DNS_CARRIER=0 CREATE_SWAP=0 NO_SWAP=0
+SETUP_FIREWALL=0 SETUP_FAIL2BAN=0
 DECOY_SITE_ROOT=""
 
 log() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
@@ -89,6 +97,12 @@ while [ $# -gt 0 ]; do
     --from-dir) need "$@"; FROM_DIR=$2; shift 2 ;;
     --token-stdin) TOKEN_STDIN=1; shift ;;
     --non-interactive) NONINTERACTIVE=1; shift ;;
+    --fix-resolved) FIX_RESOLVED=1; shift ;;
+    --skip-dns-carrier) SKIP_DNS_CARRIER=1; shift ;;
+    --create-swap) CREATE_SWAP=1; shift ;;
+    --no-swap) NO_SWAP=1; shift ;;
+    --setup-firewall) SETUP_FIREWALL=1; shift ;;
+    --setup-fail2ban) SETUP_FAIL2BAN=1; shift ;;
     --purge-firewall) PURGE_FW=1; shift ;;
     --upgrade) ACTION=upgrade; shift ;;
     --rollback) ACTION=rollback; shift ;;
@@ -99,6 +113,8 @@ while [ $# -gt 0 ]; do
     *) die "unknown flag: $1" ;;
   esac
 done
+[ "$CREATE_SWAP" -eq 1 ] && [ "$NO_SWAP" -eq 1 ] && die "--create-swap and --no-swap conflict"
+[ "$FIX_RESOLVED" -eq 1 ] && [ "$SKIP_DNS_CARRIER" -eq 1 ] && die "--fix-resolved and --skip-dns-carrier conflict"
 
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo)"
 [ "$(uname -s)" = Linux ] || die "the installer supports Linux only"
@@ -354,18 +370,227 @@ check_control_reachable() {
   log "control ok at $CONTROL"
 }
 
+udp53_lines() {
+  ss -ulnp 2>/dev/null | awk '/:53([[:space:]]|$)/ {print}' || true
+}
+
+udp53_has_any() {
+  [ -n "$(udp53_lines)" ]
+}
+
+# Non-stub: anything on :53 that is not systemd-resolved's 127.0.0.53/54 listener.
+udp53_has_nonstub() {
+  udp53_lines | grep -vE '127\.0\.0\.(53|54)' | grep -q .
+}
+
+fix_systemd_resolved_stub() {
+  mkdir -p /etc/systemd/resolved.conf.d
+  cat >/etc/systemd/resolved.conf.d/99-dotvpn-dns-carrier.conf <<'EOF'
+[Resolve]
+DNSStubListener=no
+EOF
+  # Keep local name resolution via upstream resolv.conf (not the stub).
+  if [ -f /run/systemd/resolve/resolv.conf ]; then
+    ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+  fi
+  systemctl restart systemd-resolved
+  sleep 1
+  if udp53_lines | grep -qE '127\.0\.0\.(53|54)'; then
+    die "systemd-resolved still holds UDP/53 after DNSStubListener=no"
+  fi
+  if udp53_has_nonstub; then
+    die "UDP/53 still in use after disabling the resolved stub"
+  fi
+  log "disabled systemd-resolved DNS stub listener (UDP/53 free for carrier)"
+}
+
 check_dns_carrier() {
   [ -n "$DNS_ZONE" ] || return 0
   printf '%s' "$DNS_ZONE" | grep -Eq '^[A-Za-z0-9.-]+$' || die "dns-zone looks invalid: $DNS_ZONE"
-  if ss -uln 2>/dev/null | grep -Eq '(:|\.)53\s'; then
-    die "UDP/53 is already in use; free it before enabling the DNS carrier, or skip --dns-zone"
+  if [ "$SKIP_DNS_CARRIER" -eq 1 ]; then
+    log "skipping DNS carrier (--skip-dns-carrier)"
+    DNS_ZONE=""
+    return 0
   fi
-  if command -v systemctl >/dev/null; then
-    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-      warn "systemd-resolved is active; it often binds UDP/53 — the DNS carrier may fail to start"
+  if ! udp53_has_any; then
+    log "DNS carrier zone=$DNS_ZONE (UDP/53 free — protocol suffix, not authoritative DNS)"
+    return 0
+  fi
+  if udp53_has_nonstub; then
+    die "UDP/53 is in use by a non-stub listener; free it, pass --skip-dns-carrier, or omit dns-zone"
+  fi
+  # Only the systemd-resolved stub is listening.
+  if [ "$FIX_RESOLVED" -eq 1 ]; then
+    fix_systemd_resolved_stub
+    log "DNS carrier zone=$DNS_ZONE (UDP/53 free after resolved fix)"
+    return 0
+  fi
+  if [ "$NONINTERACTIVE" -eq 1 ]; then
+    die "UDP/53 held by systemd-resolved stub: pass --fix-resolved, --skip-dns-carrier, or omit dns-zone"
+  fi
+  local choice=""
+  menu choice "UDP/53 is held by systemd-resolved (stub on 127.0.0.53). DNS carrier needs :53." \
+    "fix resolved (disable DNSStubListener, free :53)" \
+    "skip DNS carrier for this install" \
+    "abort"
+  case "$choice" in
+    fix*) fix_systemd_resolved_stub ;;
+    skip*) DNS_ZONE=""; log "DNS carrier skipped" ;;
+    *) die "aborted" ;;
+  esac
+  [ -z "$DNS_ZONE" ] || log "DNS carrier zone=$DNS_ZONE (UDP/53 free — protocol suffix, not authoritative DNS)"
+}
+
+kb_avail() {
+  df -PM "$1" 2>/dev/null | awk 'NR==2 {print $4}'
+}
+
+ensure_host_packages() {
+  local miss=()
+  command -v curl >/dev/null || miss+=(curl)
+  command -v ss >/dev/null || miss+=(iproute2)
+  command -v sha256sum >/dev/null || miss+=(coreutils)
+  [ "${#miss[@]}" -eq 0 ] && return 0
+  if command -v apt-get >/dev/null; then
+    log "installing packages: ${miss[*]}"
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${miss[@]}"
+  elif command -v dnf >/dev/null; then
+    log "installing packages: ${miss[*]}"
+    dnf install -y -q "${miss[@]}"
+  else
+    die "missing packages (${miss[*]}); install them and re-run"
+  fi
+}
+
+create_swapfile() {
+  local sz=1G
+  [ -e /swapfile ] && die "/swapfile already exists"
+  log "creating ${sz} swap at /swapfile"
+  if command -v fallocate >/dev/null; then
+    fallocate -l "$sz" /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none
+  else
+    dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none
+  fi
+  chmod 600 /swapfile
+  mkswap /swapfile >/dev/null
+  swapon /swapfile
+  if ! grep -qE '^/swapfile[[:space:]]' /etc/fstab 2>/dev/null; then
+    printf '/swapfile none swap sw 0 0\n' >>/etc/fstab
+  fi
+  log "swap enabled"
+}
+
+maybe_setup_swap() {
+  local swap_total choice=""
+  swap_total=$(awk '/SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  [ "${swap_total:-0}" -gt 0 ] && return 0
+  if [ "$CREATE_SWAP" -eq 1 ]; then
+    create_swapfile
+    return 0
+  fi
+  if [ "$NO_SWAP" -eq 1 ] || [ "$NONINTERACTIVE" -eq 1 ]; then
+    warn "no swap configured (pass --create-swap to add 1GiB /swapfile)"
+    return 0
+  fi
+  menu choice "No swap configured" "create 1GiB /swapfile" "continue without swap"
+  case "$choice" in
+    create*) create_swapfile ;;
+    *) warn "continuing without swap" ;;
+  esac
+}
+
+check_listen_tcp_free() {
+  local port a=${LISTEN:-:443}
+  port=${a##*:}
+  port=${port:-443}
+  # Occupied if something listens on *:port outside loopback.
+  if ss -tlnp 2>/dev/null | grep -E "[:.]${port}[[:space:]]" | grep -vE '127\.0\.0\.1|\[::1\]' | grep -q .; then
+    die "TCP :$port is already in use; free it or pass --listen HOST:OTHER_PORT"
+  fi
+}
+
+maybe_setup_firewall() {
+  [ "$FIREWALL" -eq 1 ] || return 0
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+    return 0
+  fi
+  if command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ "$SETUP_FIREWALL" -eq 1 ]; then
+    if command -v ufw >/dev/null; then
+      log "enabling ufw"
+      ufw --force enable >/dev/null
+      return 0
     fi
+    die "--setup-firewall needs ufw installed"
   fi
-  log "DNS carrier zone=$DNS_ZONE (UDP/53 protocol suffix — not a normal authoritative DNS host)"
+  if [ "$NONINTERACTIVE" -eq 1 ]; then
+    warn "no active ufw/firewalld: host/provider firewall must allow the relay ports"
+    return 0
+  fi
+  if ! command -v ufw >/dev/null; then
+    warn "ufw not installed; ensure the provider firewall allows the relay ports"
+    return 0
+  fi
+  local choice=""
+  menu choice "No host firewall is active" "enable ufw and open relay ports" "skip (I manage the firewall)"
+  case "$choice" in
+    enable*) ufw --force enable >/dev/null; log "ufw enabled" ;;
+    *) warn "skipping firewall setup" ;;
+  esac
+}
+
+maybe_setup_fail2ban() {
+  if systemctl is-active --quiet fail2ban 2>/dev/null; then
+    log "fail2ban already active (SSH jail only; do not jail 443)"
+    return 0
+  fi
+  if [ "$SETUP_FAIL2BAN" -eq 0 ] && [ "$NONINTERACTIVE" -eq 1 ]; then
+    return 0
+  fi
+  if [ "$SETUP_FAIL2BAN" -eq 0 ]; then
+    local choice=""
+    menu choice "fail2ban (SSH brute-force only — never jail 443)" "install and enable" "skip"
+    case "$choice" in
+      install*) ;;
+      *) return 0 ;;
+    esac
+  fi
+  if command -v apt-get >/dev/null; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq fail2ban
+  elif command -v dnf >/dev/null; then
+    dnf install -y -q fail2ban
+  else
+    warn "cannot install fail2ban automatically on this distro"
+    return 0
+  fi
+  mkdir -p /etc/fail2ban/jail.d
+  cat >/etc/fail2ban/jail.d/sshd.local <<'EOF'
+[sshd]
+enabled = true
+EOF
+  systemctl enable --now fail2ban
+  log "fail2ban enabled (sshd jail only)"
+}
+
+preflight_host() {
+  local mem_avail disk_root
+  ensure_host_packages
+  mem_avail=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  if [ "${mem_avail:-0}" -lt 262144 ]; then
+    warn "MemAvailable ${mem_avail:-0} kB is under ~256 MiB"
+  fi
+  disk_root=$(kb_avail / || echo 0)
+  if [ "${disk_root:-0}" -lt 524288 ]; then
+    die "less than ~512 MiB free on / (${disk_root:-0} kB)"
+  fi
+  maybe_setup_swap
+  check_listen_tcp_free
+  maybe_setup_firewall
+  maybe_setup_fail2ban
 }
 
 scan_web_stack() {
@@ -698,6 +923,10 @@ install_binary() {
   [ -f "$BIN" ] && cp -f "$BIN" "$BIN.prev"
   install -m 0755 "$tmp/bin" "$BIN.new"
   mv -f "$BIN.new" "$BIN"
+  # Standard install only: short ops alias. Lowkey must not plant a project name.
+  if [ "$LOWKEY" -eq 0 ] && [ "$NAME" = "dotvpn-relay" ]; then
+    ln -sfn "$BIN" /usr/local/bin/dvrelay
+  fi
 }
 
 ensure_user() {
@@ -922,6 +1151,11 @@ audit() {
 remove_install() {
   systemctl disable --now "$NAME.service" 2>/dev/null || true
   rm -f "$UNIT_FILE" "$BIN" "$BIN.prev" "$BIN.new"
+  if [ "$NAME" = "dotvpn-relay" ] && [ -L /usr/local/bin/dvrelay ]; then
+    case "$(readlink /usr/local/bin/dvrelay 2>/dev/null || true)" in
+      "$BIN"|dotvpn-relay|/usr/local/bin/dotvpn-relay) rm -f /usr/local/bin/dvrelay ;;
+    esac
+  fi
   rm -rf "$CONF_DIR"
   systemctl daemon-reload
   if id "$NAME" >/dev/null 2>&1; then userdel "$NAME" 2>/dev/null || true; fi
@@ -963,6 +1197,7 @@ printf '%s' "$CONTROL" | grep -Eq '^https://' || die "--control must be an https
 if [ -n "$LISTEN" ]; then validate_listen "$LISTEN"; fi
 if [ -n "$SNI" ]; then check_domain_dns "$SNI"; fi
 check_dns_carrier
+preflight_host
 
 if [ "$SETUP_DECOY" -eq 1 ]; then
   [ -n "$SNI" ] || die "--setup-decoy needs --sni DOMAIN"

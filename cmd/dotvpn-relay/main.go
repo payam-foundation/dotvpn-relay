@@ -46,19 +46,34 @@ const usage = `%[1]s %[2]s
   enroll   register this relay with control (one-time enrollment token)
   register open self-registration with control (community relays)
   run      serve
+  status   local service status (loopback metrics + unit)
+  doctor   local health checks (ports, decoy, disk, DNS)
   healthcheck  query the loopback health endpoint (container HEALTHCHECK)
   version  print version
 
-Run "%[1]s <command> -h" for flags.
+Run "%[1]s <command> -h" for flags. Bare TTY invocation runs status.
 `
+
+func isTTY(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, usage, prog(), version)
-		os.Exit(2)
+		if isTTY(os.Stdin) && isTTY(os.Stdout) {
+			os.Args = append(os.Args, "status")
+		} else {
+			fmt.Fprintf(os.Stderr, usage, prog(), version)
+			os.Exit(2)
+		}
 	}
 	cmds := map[string]func(context.Context, []string) error{
-		"init": cmdInit, "enroll": cmdEnroll, "register": cmdRegister, "run": cmdRun, "healthcheck": cmdHealthcheck,
+		"init": cmdInit, "enroll": cmdEnroll, "register": cmdRegister, "run": cmdRun,
+		"status": cmdStatus, "doctor": cmdDoctor, "healthcheck": cmdHealthcheck,
 		"version": func(context.Context, []string) error { fmt.Println(version); return nil },
 	}
 	run, ok := cmds[os.Args[1]]
@@ -98,8 +113,8 @@ func ident(p string) string {
 
 func envName(p string) string { return strings.ToUpper(ident(p)) + "_CONFIG" }
 
-func metricName(p string) string {
-	n := ident(p) + "_parked"
+func metricName(p, suffix string) string {
+	n := ident(p) + "_" + suffix
 	if n[0] >= '0' && n[0] <= '9' {
 		n = "_" + n
 	}
@@ -487,7 +502,10 @@ func serve(ctx context.Context, c *config.Config, beat bool) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprintln(w, "ok") })
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprintf(w, "# TYPE %[1]s gauge\n%[1]s %[2]d\n", metricName(prog()), srv.Parked())
+		parked := metricName(prog(), "parked")
+		active := metricName(prog(), "active")
+		fmt.Fprintf(w, "# TYPE %s gauge\n%s %d\n# TYPE %s gauge\n%s %d\n",
+			parked, parked, srv.Parked(), active, active, srv.Active())
 	})
 	hs := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ErrorLog: slog.NewLogLogger(slog.DiscardHandler, slog.LevelError)}
 	go func() { <-ctx.Done(); _ = hs.Close() }()

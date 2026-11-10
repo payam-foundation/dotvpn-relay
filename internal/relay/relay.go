@@ -93,6 +93,9 @@ func (s *Server) keys() [][]byte {
 // Parked is the number of idle node connections held.
 func (s *Server) Parked() int { return s.pool.count() }
 
+// Active is the number of in-flight TCP/DNS sessions holding a concurrency slot.
+func (s *Server) Active() int { return len(s.sem) }
+
 // ServeTCP accepts until ctx ends or ln fails.
 func (s *Server) ServeTCP(ctx context.Context, ln net.Listener) error {
 	go func() { <-ctx.Done(); _ = ln.Close() }()
