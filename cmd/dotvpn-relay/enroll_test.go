@@ -114,7 +114,7 @@ func TestNamesFollowProgramName(t *testing.T) {
 		if got := envName(c.prog); got != c.env {
 			t.Errorf("envName(%q) = %q, want %q", c.prog, got, c.env)
 		}
-		if got := metricName(c.prog); got != c.metric {
+		if got := metricName(c.prog, "parked"); got != c.metric {
 			t.Errorf("metricName(%q) = %q, want %q", c.prog, got, c.metric)
 		}
 	}
