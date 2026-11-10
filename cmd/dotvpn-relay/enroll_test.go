@@ -43,7 +43,7 @@ func TestEnrollPin(t *testing.T) {
 func TestRegisterProofOfPossession(t *testing.T) {
 	var gotBody map[string]any
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/relays/register" || r.Method != http.MethodPost {
+		if r.URL.Path != "/api/v1/relays/register" || r.Method != http.MethodPost {
 			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
 			http.Error(w, "no", 404)
 			return
@@ -93,7 +93,11 @@ func TestRegisterProofOfPossession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.RelayID != "rid" || c.Name != "quiet-grove-abcd" || c.ControlURL != srv.URL || c.ControlPin != pin {
+	wantCtrl, err := parseControlURL(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RelayID != "rid" || c.Name != "quiet-grove-abcd" || c.ControlURL != wantCtrl.String() || c.ControlPin != pin {
 		t.Fatalf("config not updated: %+v", c)
 	}
 	if len(c.TrustedKeys) != 1 || c.TrustedKeys[0] != "ctl" {
@@ -142,11 +146,15 @@ func TestReadToken(t *testing.T) {
 }
 
 func TestDefaultControlURL(t *testing.T) {
-	if defaultControlURL != "https://ctrl.dotvpn.org" {
+	if defaultControlURL != "https://ctrl.dotvpn.org/api" {
 		t.Fatalf("defaultControlURL = %q", defaultControlURL)
 	}
 	u, err := parseControlURL(defaultControlURL)
-	if err != nil || u.Host != "ctrl.dotvpn.org" {
+	if err != nil || u.Host != "ctrl.dotvpn.org" || u.Path != "/api" {
 		t.Fatalf("parse default: %v %v", u, err)
+	}
+	u, err = parseControlURL("ctrl.dotvpn.org")
+	if err != nil || u.String() != "https://ctrl.dotvpn.org/api" {
+		t.Fatalf("parse domain: %v %v", u, err)
 	}
 }

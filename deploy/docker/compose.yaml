@@ -1,5 +1,5 @@
 # Restricted-country hop. Init once, then either enroll (curated) or register (community).
-# enroll/register default to https://ctrl.dotvpn.org; pass -control for a lab core.
+# enroll/register default to https://ctrl.dotvpn.org/api; pass -control DOMAIN for a lab core.
 #   docker compose run --rm dotvpn-relay init -config /data/config.yaml -decoy host.docker.internal:8443
 #   # curated (control URL not stored):
 #   docker compose run --rm -T dotvpn-relay enroll -config /data/config.yaml -token -
