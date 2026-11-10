@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/payam-foundation/dotvpn-relay/compare/v0.6.1...v0.7.0) (2026-11-10)
+
+
+### Features
+
+* **deploy:** control domain defaults to /api ([#26](https://github.com/payam-foundation/dotvpn-relay/issues/26)) ([a53e1ba](https://github.com/payam-foundation/dotvpn-relay/commit/a53e1ba8e266e5689ad712216f349a996b6afb8b))
+
 ## [0.6.1](https://github.com/payam-foundation/dotvpn-relay/compare/v0.6.0...v0.6.1) (2026-11-10)
 
 
