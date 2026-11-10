@@ -442,7 +442,8 @@ check_dns_carrier() {
 }
 
 kb_avail() {
-  df -PM "$1" 2>/dev/null | awk 'NR==2 {print $4}'
+  # Prefer POSIX -Pk (1024-byte blocks). -PM is GNU-only and missing on some images.
+  df -Pk "$1" 2>/dev/null | awk 'NR==2 {print $4}'
 }
 
 ensure_host_packages() {
