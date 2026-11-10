@@ -288,10 +288,16 @@ check_domain_dns() {
   fi
 }
 
+# Strip whitespace/newlines so a hard-wrapped TUI token still works when pasted.
+normalize_enroll_token() {
+  ENROLL_TOKEN=$(printf '%s' "${ENROLL_TOKEN:-}" | tr -d '[:space:]')
+}
+
 # Loads addr/sni/dns from a curated enroll token without consuming it.
 # Fills empty LISTEN/SNI/DNS_ZONE so the installer does not re-ask core answers.
 apply_enroll_pending() {
   [ "$REGISTER" -eq 0 ] || return 0
+  normalize_enroll_token
   [ -n "${ENROLL_TOKEN:-}" ] || return 0
   command -v curl >/dev/null || die "curl is required to load pending relay metadata from the enroll token"
   command -v python3 >/dev/null || die "python3 is required to parse pending relay metadata from control"
@@ -301,7 +307,7 @@ apply_enroll_pending() {
     -H "Authorization: Bearer ${ENROLL_TOKEN}" -H "Accept: application/json" "$url" 2>/dev/null || printf '000')
   if [ "$http" != "200" ]; then
     if [ "$http" = "401" ]; then
-      hint=" Token invalid, expired, or already used — create a new relay in core and paste the new token."
+      hint=" Token invalid, expired, truncated on copy, or already used — on core: Relays → Show enroll token (or: dvadmin relays enroll-token ID)."
     elif [ "$http" = "404" ] || [ "$http" = "000" ] || grep -qi '<html' "$tmp" 2>/dev/null; then
       hint=" Wrong control domain (API is https://DOMAIN/api; default ctrl.dotvpn.org)."
     fi
@@ -536,6 +542,7 @@ interactive_fill() {
       IFS= read -rsp "enrollment token: " ENROLL_TOKEN < /dev/tty || true
       echo > /dev/tty
     fi
+    normalize_enroll_token
     [ -n "${ENROLL_TOKEN:-}" ] || die "no enrollment token: create a relay in core TUI/CLI first, or pass ENROLL_TOKEN / --init-only"
     apply_enroll_pending
     curated_from_token=1
@@ -825,10 +832,11 @@ fix_conf_owner() {
 }
 
 read_token() {
-  if [ -n "${ENROLL_TOKEN:-}" ]; then return; fi
+  if [ -n "${ENROLL_TOKEN:-}" ]; then normalize_enroll_token; return; fi
   if [ "$TOKEN_STDIN" -eq 1 ]; then IFS= read -r ENROLL_TOKEN || true
   elif [ -r /dev/tty ]; then IFS= read -rsp "enrollment token: " ENROLL_TOKEN </dev/tty || true; echo >&2
   fi
+  normalize_enroll_token
   [ -n "${ENROLL_TOKEN:-}" ] || die "no enrollment token: set ENROLL_TOKEN, use --token-stdin, or run from a terminal"
 }
 
