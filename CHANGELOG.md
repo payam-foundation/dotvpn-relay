@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/payam-foundation/dotvpn-relay/compare/v0.3.0...v0.4.0) (2026-11-10)
+
+
+### Features
+
+* **deploy:** interactive installer, cosign verify, and runtime hardening ([#18](https://github.com/payam-foundation/dotvpn-relay/issues/18)) ([0824e71](https://github.com/payam-foundation/dotvpn-relay/commit/0824e710a64b45749d37b8ada1cace808b67ea2c))
+
 ## [0.3.0](https://github.com/payam-foundation/dotvpn-relay/compare/v0.2.1...v0.3.0) (2026-11-09)
 
 
