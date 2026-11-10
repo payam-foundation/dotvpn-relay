@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/payam-foundation/dotvpn-relay/compare/v0.6.0...v0.6.1) (2026-11-10)
+
+
+### Bug Fixes
+
+* **deploy:** ask control URL before curated pending fetch ([#24](https://github.com/payam-foundation/dotvpn-relay/issues/24)) ([ad7d3f5](https://github.com/payam-foundation/dotvpn-relay/commit/ad7d3f51b326fb98ad1a1b282cfa369f99c462e3))
+
 ## [0.6.0](https://github.com/payam-foundation/dotvpn-relay/compare/v0.5.0...v0.6.0) (2026-11-10)
 
 
