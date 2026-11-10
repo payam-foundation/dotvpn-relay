@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/payam-foundation/dotvpn-relay/compare/v0.7.1...v0.8.0) (2026-11-10)
+
+
+### Features
+
+* **deploy:** installer preflight + status/doctor ([#30](https://github.com/payam-foundation/dotvpn-relay/issues/30)) ([ac5e493](https://github.com/payam-foundation/dotvpn-relay/commit/ac5e493cad54beac62aa79ef91abd8d4644977e0))
+
 ## [0.7.1](https://github.com/payam-foundation/dotvpn-relay/compare/v0.7.0...v0.7.1) (2026-11-10)
 
 
