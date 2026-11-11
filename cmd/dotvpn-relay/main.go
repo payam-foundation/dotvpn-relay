@@ -548,11 +548,12 @@ func beatLoop(ctx context.Context, c *config.Config, priv ed25519.PrivateKey, sr
 	send := func() {
 		ts := time.Now().Unix()
 		parked := srv.Parked()
-		msg := []byte(fmt.Sprintf("beat|%s|%s|%d|%d", c.RelayID, version, parked, ts))
+		active := srv.Active()
+		msg := []byte(fmt.Sprintf("beat|%s|%s|%d|%d|%d", c.RelayID, version, parked, active, ts))
 		sig := base64.RawURLEncoding.EncodeToString(ed25519.Sign(priv, msg))
 		body, _ := json.Marshal(map[string]any{
 			"relay_id": c.RelayID, "public_key": pub, "version": version,
-			"parked": parked, "timestamp": ts, "signature": sig,
+			"parked": parked, "active": active, "timestamp": ts, "signature": sig,
 		})
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, base.JoinPath("/v1/relays/beat").String(), bytes.NewReader(body))
 		if err != nil {
@@ -561,8 +562,11 @@ func beatLoop(ctx context.Context, c *config.Config, priv ed25519.PrivateKey, sr
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := controlClient(c.ControlPin).Do(req)
 		if err != nil {
-			log.Debug("beat failed")
+			log.Debug("beat failed", "err", err)
 			return
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			log.Warn("beat rejected", "status", resp.StatusCode)
 		}
 		_ = resp.Body.Close()
 	}
