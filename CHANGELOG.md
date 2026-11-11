@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/payam-foundation/dotvpn-relay/compare/v0.8.1...v0.9.0) (2026-11-11)
+
+
+### Features
+
+* **relay:** include active count in signed beats ([#34](https://github.com/payam-foundation/dotvpn-relay/issues/34)) ([5fc3ed7](https://github.com/payam-foundation/dotvpn-relay/commit/5fc3ed7beb0785d860a851fc665a1e944402edfe))
+
 ## [0.8.1](https://github.com/payam-foundation/dotvpn-relay/compare/v0.8.0...v0.8.1) (2026-11-10)
 
 
