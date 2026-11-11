@@ -1,6 +1,6 @@
 module github.com/payam-foundation/dotvpn-relay
 
-go 1.27.3
+go 1.27.4
 
 require (
 	github.com/payam-foundation/dotvpn-wire v0.2.1
