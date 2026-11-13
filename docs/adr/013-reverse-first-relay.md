@@ -10,6 +10,8 @@ Passthrough forwarding made the relay dial the node. Client configs then carried
 
 The relay only listens. Core nodes dial out to it and keep a pool of parked tunnels (pool knock plus a pool token). A client reaches a node by naming the node ID; the relay splices the client onto a parked tunnel. X25519 forward secrecy on every session; pool tunnels rotate by random time or byte budget; idle padding and jittered keepalive. A DNS-shaped UDP carrier covers UDP-friendly, TCP-hostile paths.
 
+When the DNS carrier is enabled, its zone is the same singular `domain` used as TLS SNI (ADR-025). There is no separate `dns_zone` / SNI pair; catalog expansion uses `IP:53` with `params.zone=domain` and `dns_carrier` as the opt-in flag. Guidance that SNI ≠ zone is obsolete.
+
 The node's address appears in no client list and in no relay config. Clients pin the node's identity key end to end, so the relay cannot read or alter traffic.
 
 ## Risks

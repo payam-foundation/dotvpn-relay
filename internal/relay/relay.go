@@ -14,8 +14,10 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/payam-foundation/dotvpn-wire/auth"
@@ -39,6 +41,8 @@ type Options struct {
 	MaxConns int
 	// MaxPoolPerNode and MaxPool bound parked connections. Defaults 16, 1024.
 	MaxPoolPerNode, MaxPool int
+	// Bandwidth caps splice traffic only (not decoy). Optional.
+	Bandwidth BandwidthOpts
 }
 
 // Server is a relay.
@@ -50,6 +54,11 @@ type Server struct {
 	mimic   *mimic.Server
 	sem     chan struct{}
 	frame   frame.Opts
+	bw      *Bandwidth
+
+	bytesIn  atomic.Uint64
+	bytesOut atomic.Uint64
+	sessions atomic.Uint64
 }
 
 // New validates o and returns a Server.
@@ -77,6 +86,7 @@ func New(o Options) (*Server, error) {
 		pool:  newPool(o.MaxPoolPerNode, o.MaxPool),
 		sem:   make(chan struct{}, o.MaxConns),
 		frame: frame.Opts{Idle: reverse.DefaultIdle},
+		bw:    newBandwidth(o.Bandwidth),
 	}
 	s.poolKey = reverse.PoolKnockKey(s.pub)
 	s.mimic = &mimic.Server{KeysFn: s.keys}
@@ -96,8 +106,24 @@ func (s *Server) Parked() int { return s.pool.count() }
 // Active is the number of in-flight TCP/DNS sessions holding a concurrency slot.
 func (s *Server) Active() int { return len(s.sem) }
 
+// BytesIn is lifetime bytes read from clients (toward the node).
+func (s *Server) BytesIn() uint64 { return s.bytesIn.Load() }
+
+// BytesOut is lifetime bytes written to clients (from the node).
+func (s *Server) BytesOut() uint64 { return s.bytesOut.Load() }
+
+// Sessions is lifetime spliced client sessions (no client IPs retained).
+func (s *Server) Sessions() uint64 { return s.sessions.Load() }
+
+// BandwidthThrottled reports whether the rolling-average soft cap is engaged.
+func (s *Server) BandwidthThrottled() bool { return s.bw.Throttled() }
+
+// BandwidthRates returns approximate recent ingress/egress bytes per second.
+func (s *Server) BandwidthRates() (inBps, outBps uint64) { return s.bw.Rates() }
+
 // ServeTCP accepts until ctx ends or ln fails.
 func (s *Server) ServeTCP(ctx context.Context, ln net.Listener) error {
+	go s.bw.startAvg(ctx)
 	go func() { <-ctx.Done(); _ = ln.Close() }()
 	for {
 		c, err := ln.Accept()
@@ -112,7 +138,8 @@ func (s *Server) ServeTCP(ctx context.Context, ln net.Listener) error {
 			return err
 		}
 		if !s.acquire() {
-			_ = c.Close()
+			// Probe resistance (ADR-014): under load, still answer like a real site.
+			s.o.Fallback(c)
 			continue
 		}
 		go func() {
@@ -182,8 +209,42 @@ func (s *Server) splice(client net.Conn, nodeID string) {
 		_ = client.Close()
 		return
 	}
-	transport.Splice(client, p)
+	s.sessions.Add(1)
+	// Count only on the client side so each byte is tallied once.
+	// Throttle Dot VPN splices only — decoy passthrough is untouched.
+	var c net.Conn = &countingConn{Conn: client, read: &s.bytesIn, written: &s.bytesOut}
+	if s.bw.enabled() {
+		c = &throttledConn{
+			Conn: client, bw: s.bw, read: &s.bytesIn, written: &s.bytesOut,
+			ctx: context.Background(),
+		}
+	}
+	transport.Splice(c, p)
 }
+
+// countingConn tallies Read/Write bytes into atomics (client→node = in).
+type countingConn struct {
+	net.Conn
+	read, written *atomic.Uint64
+}
+
+func (c *countingConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.read.Add(uint64(n))
+	}
+	return n, err
+}
+
+func (c *countingConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if n > 0 {
+		c.written.Add(uint64(n))
+	}
+	return n, err
+}
+
+var _ io.ReadWriter = (*countingConn)(nil)
 
 // ServeDNS serves the DNS-shaped UDP carrier for zone on pc. A client names
 // the node first, then runs the session handshake through the relay.

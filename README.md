@@ -12,7 +12,7 @@
 
 The in-country stealth hop of [Dot VPN](https://github.com/payam-foundation/dotvpn-wire#related-repositories). A relay looks like an ordinary HTTPS website to anyone who is not a Dot VPN client, and splices clients onto tunnels that a `dotvpn-core` node has parked on it.
 
-A relay has **no client code, no admin code, and no user accounts**. It holds its own identity key and control's public key. Curated (admin) enrollment never stores control's URL. Community self-registration stores it only so the relay can send optional health beats; use `run -no-beat` (or the installer's `--no-beat`) to keep the seizure posture of curated installs.
+A relay has **no client code, no admin code, and no user accounts**. It holds its own identity key and control's public key. **Control URL** and **beat mode** are independent (ADR-024): empty `control_url` resolves to `https://ctrl.dotvpn.org/api` when beats need it; `beat_mode` defaults to `disabled`. Curated enroll keeps the seizure posture (no URL override + disabled). Community `register` stores the control used and sets `beat_mode=normal` (required for pool membership; core drops `requires_beat` relays after ~90s without a beat). Modes: `normal` (~45–75s), `conservative` (1h telemetry), `telemetry` (12h), `disabled`.
 
 ## Status
 
@@ -44,7 +44,7 @@ flowchart LR
 - **Optional DNS-shaped UDP carrier** for paths that pass UDP but not TCP.
 - **Decoy for everything else.** Anything that is not a valid, unreplayed knock is handed to a real TLS server and receives that server's answer. There is no silent close or reset on the probe path, and timing stays uniform.
 - **Two ways onto the network.** Admins mint a one-time enroll token (curated). Anyone can `register` as a community relay; control probes the host and may quarantine or promote it. Optional signed beats report version and parked-tunnel count.
-- **No access logs.** No persisted client IPs, no version banner. `/healthz` and `/metrics` bind to loopback only. Beats are opt-out with `-no-beat`.
+- **No access logs.** No persisted client IPs, no version banner. `/healthz` and `/metrics` bind to loopback only. Beats follow `beat_mode` (or `run -beat-mode` / legacy `-no-beat`).
 
 ## Quick start
 
@@ -58,17 +58,39 @@ dotvpn-relay enroll -config /etc/dotvpn-relay/config.yaml -token <one-time token
 dotvpn-relay run    -config /etc/dotvpn-relay/config.yaml
 ```
 
-The control URL is used once and **not** written to disk. For a self-signed control certificate, pass `-control https://…` and `-pin <base64 SHA-256 SPKI>`.
+The control URL is used for enroll and **not** written to disk by default (ADR-012). Pass `-beat-mode normal` (and `-store-control` for a non-default plane) to opt into beats. For a self-signed control certificate, pass `-control https://…` and `-pin <base64 SHA-256 SPKI>`.
+
+Bare TTY (`dvrelay` / `dotvpn-relay`) opens a local **TUI**. `status` prints plain metrics for scripts (version, parked, active, bytes, sessions, beat mode, bandwidth).
+
+To change beats later: `dotvpn-relay beat normal|conservative|telemetry|disabled`, then restart the unit. `beat control -url …` sets the override. For curated pool membership also set `requires_beat: true` on that relay in admin.
+
+### Tuning (YAML)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `beat_mode` | `disabled` | `disabled` \| `normal` \| `conservative` \| `telemetry` |
+| `control_url` | (empty → production default) | Optional control API override |
+| `domain` | from enroll/register | Singular hostname: TLS SNI and DNS carrier zone when enabled (ADR-025); local DNS/TLS checks (catalog updates stay on admin). Obsolete: `sni` / `dns_zone` |
+| `max_conns` | 4096 | Concurrent in-flight TCP/DNS sessions |
+| `max_pool_per_node` | 16 | Parked reverse tunnels per node |
+| `max_pool` | 1024 | Global parked-tunnel cap |
+| `bandwidth_ingress_mbps` | 0 | Splice ingress cap (peer→relay); 0 = unlimited |
+| `bandwidth_egress_mbps` | 0 | Splice egress cap (relay→peer); 0 = unlimited |
+| `bandwidth_avg_window` | unset | e.g. `24h` rolling average soft-cap window |
+| `bandwidth_avg_cap_mbps` | unset | Engage throttle when average Mbps exceeds this |
+| `bandwidth_throttle_mbps` | unset | Sustained Mbps while soft-cap is engaged |
+
+On Linux, raise `nf_conntrack_max` if you see conntrack drops under load; QUIC idle is governed by wire keepalives (~10s / 2m / 3m).
 
 ### Community (open self-registration)
 
 ```sh
 dotvpn-relay init     -config /etc/dotvpn-relay/config.yaml -decoy 127.0.0.1:8443 -listen PUBLIC_IP:443
-dotvpn-relay register -config /etc/dotvpn-relay/config.yaml -sni cdn.example.com -port 443
+dotvpn-relay register -config /etc/dotvpn-relay/config.yaml -domain cdn.example.com -port 443
 dotvpn-relay run      -config /etc/dotvpn-relay/config.yaml
 ```
 
-`register` proves possession of the identity key, stores `relay_id`, control's trusted keys, and `control_url` (and `-pin` when given) for beats. Share `dotvpn-relay://<relay_id>` with clients that opt into community relays. Pass `-no-beat` to `run` if you do not want periodic contact with control.
+`register` proves possession of the identity key, stores `relay_id`, control's trusted keys, `control_url` (and `-pin` when given), and `beat_mode=normal`. Share `dvr://<relay_id>` with clients that opt into community relays. Use `beat disabled` or `run -beat-mode disabled` (legacy `-no-beat`) to stop beats (the relay will leave pools after ~90s).
 
 ### Docker
 
@@ -107,18 +129,18 @@ curl -fsSL https://raw.githubusercontent.com/payam-foundation/dotvpn-relay/main/
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/payam-foundation/dotvpn-relay/main/deploy/install.sh \
-  | sudo bash -s -- --register --sni relay.example.com \
+  | sudo bash -s -- --register --domain relay.example.com \
     --decoy 127.0.0.1:8443 --listen <public-ip>:443
 ```
 
-Both default `--control` to domain `ctrl.dotvpn.org` (API at `https://ctrl.dotvpn.org/api`). Pass a bare domain; the installer/CLI append `/api`. A curated token must be redeemed against the **same** control that minted it. The enroll token travels by environment or stdin (`enroll -token -`), never argv. Curated non-interactive installs without a token fail unless `--init-only`. Preflight covers packages, disk/mem/swap, listen-port conflicts, firewall/fail2ban asks, and DNS-carrier vs systemd-resolved (`--fix-resolved` / `--skip-dns-carrier`). `--setup-decoy`, `--require-dns`, `--dns-zone`, `--upgrade`, `--rollback`, `--uninstall` (optional `--purge-firewall`), `--pin`, `--no-beat`, `--from-dir` and `--lowkey` are in `install.sh --help`. A failed enroll/register removes what the install created. The DNS carrier (`--dns-zone`) is off by default; it is a UDP/53 protocol suffix, not normal authoritative DNS hosting. Standard installs also place a `dvrelay` symlink to `dotvpn-relay` for local ops (`dvrelay status`, `dvrelay doctor`).
+Both default `--control` to domain `ctrl.dotvpn.org` (API at `https://ctrl.dotvpn.org/api`). Pass a bare domain; the installer/CLI append `/api`. A curated token must be redeemed against the **same** control that minted it. The enroll token travels by environment or stdin (`enroll -token -`), never argv. Curated non-interactive installs without a token fail unless `--init-only`. Interactive install asks for beat mode and optional bandwidth caps separately from the control domain. Preflight covers packages, disk/mem/swap, listen-port conflicts, firewall/fail2ban asks, and DNS-carrier vs systemd-resolved (`--fix-resolved` / `--skip-dns-carrier`). `--setup-decoy`, `--require-dns`, `--dns-carrier` (UDP `:53`; zone = `--domain`), `--upgrade`, `--rollback`, `--uninstall` (optional `--purge-firewall`), `--pin`, `--beat-mode`, `--no-beat`, `--store-control`, `--bw-ingress` / `--bw-egress` / `--bw-avg-cap` / `--bw-throttle`, `--from-dir` and `--lowkey` are in `install.sh --help`. A failed enroll/register removes what the install created. The DNS carrier (`--dns` / local `dns_listen`) is off by default; it is a UDP/53 protocol suffix, not normal authoritative DNS hosting. **Obsolete:** `--sni`, `--dns-zone`, and any guidance that SNI ≠ zone — one `domain` covers both (ADR-025). Standard installs also place a `dvrelay` symlink to `dotvpn-relay` for local ops (bare `dvrelay` opens the TUI; `dvrelay status` / `dvrelay doctor` for scripts).
 
 ### Ports
 
 | Mode | TCP | UDP |
 |---|---|---|
-| Native systemd | listen port (default 443) | 53 only with `--dns-zone` |
-| Docker Compose | `443:443/tcp` | uncomment `53:53/udp` when `dns_listen`/`dns_zone` are set |
+| Native systemd | listen port (default 443) | 53 only with `--dns-carrier` / `dns_listen` (zone = `domain`) |
+| Docker Compose | `443:443/tcp` | uncomment `53:53/udp` when `dns_listen` is set (`dns_carrier` in catalog) |
 | Admin/metrics | loopback only (default `127.0.0.1:9101`) | — |
 
 ### Lowkey install
@@ -135,9 +157,9 @@ This lowers fingerprinting by scanners and casual inspection. It does not make a
 ### Production guidance
 
 - **Use a real decoy.** Point `-decoy` at a stock nginx or Caddy with a real certificate for a plausible domain (any geography; no software geo-check). It should send no HTTP/3 `alt-svc` (the relay is TCP-only), keep its own `Server` header and error pages, and have no admin API. The built-in decoy (`-tls-cert`, `-tls-key`) exists for tests. Installer `--setup-decoy` can provision a system Caddy/nginx on loopback for your domain.
-- **Domain / SNI.** Clients and nodes present your domain as SNI. DNS must point at this host without a proxied CDN in front of the relay.
+- **Domain.** One hostname (`domain`): clients and nodes present it as TLS SNI, and it is the DNS carrier zone when the carrier is on (ADR-025). Point DNS-only A/AAAA at this host — no proxied CDN. Obsolete: separate `sni` / `dns_zone` / “SNI ≠ zone”.
 - **One relay, many nodes.** Each node parks its own tunnels, keyed by node ID. Give each user cohort its own relay set, so revoking one relay does not affect the others.
-- **DNS carrier.** Optional. Add `-dns-listen` and `-dns-zone` to `init` (or installer `--dns-zone`) to enable it. They go together. If only systemd-resolved's stub holds loopback :53, the installer asks to disable `DNSStubListener`, skip the carrier, or abort (`--fix-resolved` / `--skip-dns-carrier` when non-interactive). A non-stub listener on :53 still fails hard.
+- **DNS carrier.** Optional. Enable with installer `--dns-carrier`, CLI `-dns`, or YAML `dns_listen` (zone is always `domain`; catalog `dns_carrier`). If only systemd-resolved's stub holds loopback :53, the installer asks to disable `DNSStubListener`, skip the carrier, or abort (`--fix-resolved` / `--skip-dns-carrier` when non-interactive). A non-stub listener on :53 still fails hard.
 - **Community visibility.** Self-registered relays start `public=false`; an admin promotes them with `PATCH /v1/admin/relays/{id}` (`public: true`). They must beat about every 30–45s or they leave node pools after ~90s.
 
 Rationale and residual risks: [ADR-015](docs/adr/015-relay-operational-exposure.md).
@@ -147,7 +169,7 @@ Rationale and residual risks: [ADR-015](docs/adr/015-relay-operational-exposure.
 | Resists | Does not resist |
 |---|---|
 | Active probing: non-TLS bytes, wrong or missing SNI, partial hellos, bad or replayed knocks all get the decoy's answer. | Traffic-shape analysis: tunnelled traffic keeps its packet-size and timing profile; padding covers the handshake only. |
-| Relay seizure (curated): the host holds only its own identity and control's public key. Revoke it at control and enrol a new one. | Community register also stores `control_url` (and optional TLS pin) for beats unless you run with `-no-beat` and clear those fields. |
+| Relay seizure (curated): the host holds only its own identity and control's public key. Revoke it at control and enrol a new one. | Community register stores a `control_url` override; beats follow `beat_mode` (default `normal`). Curated default is no override + `disabled`. |
 | Replay: the knock cache and token expiry refuse replays; sessions have forward secrecy. | Hosting-provider netflow, payment identity and host connection tracking, which link a relay to its operator. |
 | Fingerprinting: the ClientHello matches current Chrome and replies match stock nginx on the tested host. | A censor that blocks the relay's address outright. Anything not yet captured from a real censored network. |
 

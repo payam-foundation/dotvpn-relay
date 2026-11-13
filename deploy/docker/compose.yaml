@@ -14,7 +14,7 @@ services:
     restart: unless-stopped
     ports:
       - "443:443/tcp"
-      # Publish UDP/53 only when dns_listen/dns_zone are set in config.yaml.
+      # Publish UDP/53 only when dns_listen (and domain) are set in config.yaml.
       # - "53:53/udp"
     volumes:
       - relay:/data
