@@ -1136,11 +1136,11 @@ open_ports() {
   if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
     ufw allow "$port/tcp" >/dev/null
     [ "$DNS_CARRIER" -eq 1 ] && ufw allow 53/udp >/dev/null
-    { printf '%s\n' "$port/tcp"; [ "$DNS_CARRIER" -eq 1 ] && echo 53/udp; } >"$CONF_DIR/firewall.ports"
+    { printf '%s\n' "$port/tcp"; [ "$DNS_CARRIER" -ne 1 ] || echo 53/udp; } >"$CONF_DIR/firewall.ports"
     log "opened $port/tcp$([ "$DNS_CARRIER" -eq 1 ] && echo ' and 53/udp') in ufw (uninstall keeps rules unless --purge-firewall)"
   elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
     firewall-cmd -q --permanent --add-port="$port/tcp" && { [ "$DNS_CARRIER" -ne 1 ] || firewall-cmd -q --permanent --add-port=53/udp; } && firewall-cmd -q --reload
-    { printf '%s\n' "$port/tcp"; [ "$DNS_CARRIER" -eq 1 ] && echo 53/udp; } >"$CONF_DIR/firewall.ports"
+    { printf '%s\n' "$port/tcp"; [ "$DNS_CARRIER" -ne 1 ] || echo 53/udp; } >"$CONF_DIR/firewall.ports"
     log "opened $port/tcp$([ "$DNS_CARRIER" -eq 1 ] && echo ' and 53/udp') in firewalld (uninstall keeps rules unless --purge-firewall)"
   else
     warn "no active ufw/firewalld: ensure $port/tcp$([ "$DNS_CARRIER" -eq 1 ] && echo ' and 53/udp') are reachable on the host/provider firewall"
