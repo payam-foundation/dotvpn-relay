@@ -339,7 +339,7 @@ check_domain_tls() {
   else
     target="${host}:${port}"
   fi
-  if printf '' | openssl s_client -connect "$target" -servername "$host" -brief </dev/null 2>/dev/null | grep -qiE 'Protocol version|CONNECTION ESTABLISHED|Verification'; then
+  if openssl s_client -connect "$target" -servername "$host" -brief </dev/null 2>&1 | grep -qiE 'Protocol version|CONNECTION ESTABLISHED|Verification'; then
     log "TLS SNI $host ok on $target"
     return 0
   fi

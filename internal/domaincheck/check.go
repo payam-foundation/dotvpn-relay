@@ -130,9 +130,8 @@ func Check(ctx context.Context, domain, listen, dnsListen string) Report {
 	rep.Results = append(rep.Results, Result{Name: "tcp", OK: true, Detail: dialTarget + " accepts TCP"})
 
 	tlsConn := tls.Client(conn, &tls.Config{
-		ServerName:         domain,
-		InsecureSkipVerify: true, // #nosec G402 — we only need a handshake/cert presence, not WebPKI trust
-		MinVersion:         tls.VersionTLS12,
+		ServerName: domain,
+		MinVersion: tls.VersionTLS12,
 	})
 	_ = tlsConn.SetDeadline(time.Now().Add(5 * time.Second))
 	if err := tlsConn.HandshakeContext(dctx); err != nil {

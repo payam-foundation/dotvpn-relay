@@ -13,10 +13,10 @@ import (
 // Average soft-cap: when combined ingress+egress average over AvgWindow exceeds
 // AvgCapMbps, both directions are limited to ThrottleMbps until the average falls.
 type BandwidthOpts struct {
-	IngressMbps float64
-	EgressMbps  float64
-	AvgWindow   time.Duration
-	AvgCapMbps  float64
+	IngressMbps  float64
+	EgressMbps   float64
+	AvgWindow    time.Duration
+	AvgCapMbps   float64
 	ThrottleMbps float64
 }
 
@@ -102,17 +102,17 @@ type Bandwidth struct {
 	avgCap          float64
 	throttleMbps    float64
 
-	mu       sync.Mutex
-	samples  []bwSample
+	mu        sync.Mutex
+	samples   []bwSample
 	throttled atomic.Bool
 	inRate    atomic.Uint64 // recent bytes/sec estimate
 	outRate   atomic.Uint64
 }
 
 type bwSample struct {
-	at   time.Time
-	in   uint64
-	out  uint64
+	at  time.Time
+	in  uint64
+	out uint64
 }
 
 func newBandwidth(o BandwidthOpts) *Bandwidth {
