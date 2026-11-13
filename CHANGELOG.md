@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/payam-foundation/dotvpn-relay/compare/v0.9.0...v0.10.0) (2026-11-13)
+
+
+### Features
+
+* beat modes, bandwidth throttle, domain check, TUI and config migration ([#36](https://github.com/payam-foundation/dotvpn-relay/issues/36)) ([ba85782](https://github.com/payam-foundation/dotvpn-relay/commit/ba857821515c37949ffb0d054e0ba6df51055b04))
+
 ## [0.9.0](https://github.com/payam-foundation/dotvpn-relay/compare/v0.8.1...v0.9.0) (2026-11-11)
 
 
