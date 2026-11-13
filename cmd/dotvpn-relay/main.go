@@ -45,13 +45,19 @@ const usage = `%[1]s %[2]s
   init     write a config with a fresh identity key
   enroll   register this relay with control (one-time enrollment token)
   register open self-registration with control (community relays)
+  profile  read or update public listing, email and country
+  donate   alias: make this community relay public (-public)
+  undonate alias: make this community relay private (-private)
   run      serve
-  status   local service status (loopback metrics + unit)
+  status   local service status (plain text; scripts)
+  tui      interactive local ops console (default on a TTY)
+  beat     set beat mode / control URL override (independent knobs)
+  configure  set beat mode, control override, and bandwidth caps
   doctor   local health checks (ports, decoy, disk, DNS)
   healthcheck  query the loopback health endpoint (container HEALTHCHECK)
   version  print version
 
-Run "%[1]s <command> -h" for flags. Bare TTY invocation runs status.
+Run "%[1]s <command> -h" for flags. Bare TTY invocation opens the TUI.
 `
 
 func isTTY(f *os.File) bool {
@@ -65,7 +71,7 @@ func isTTY(f *os.File) bool {
 func main() {
 	if len(os.Args) < 2 {
 		if isTTY(os.Stdin) && isTTY(os.Stdout) {
-			os.Args = append(os.Args, "status")
+			os.Args = append(os.Args, "tui")
 		} else {
 			fmt.Fprintf(os.Stderr, usage, prog(), version)
 			os.Exit(2)
@@ -73,7 +79,9 @@ func main() {
 	}
 	cmds := map[string]func(context.Context, []string) error{
 		"init": cmdInit, "enroll": cmdEnroll, "register": cmdRegister, "run": cmdRun,
-		"status": cmdStatus, "doctor": cmdDoctor, "healthcheck": cmdHealthcheck,
+		"profile": cmdProfile, "donate": cmdDonate, "undonate": cmdUndonate,
+		"status": cmdStatus, "tui": cmdTUI, "beat": cmdBeat, "configure": cmdConfigure,
+		"doctor": cmdDoctor, "healthcheck": cmdHealthcheck,
 		"version": func(context.Context, []string) error { fmt.Println(version); return nil },
 	}
 	run, ok := cmds[os.Args[1]]
@@ -177,8 +185,9 @@ func cmdInit(_ context.Context, args []string) error {
 	decoy := fs.String("decoy", "", "host:port of a real TLS server for everyone who is not a peer")
 	cert := fs.String("tls-cert", "", "built-in TLS decoy certificate (instead of -decoy)")
 	key := fs.String("tls-key", "", "built-in TLS decoy key")
-	dnsListen := fs.String("dns-listen", "", "enable the DNS-shaped UDP carrier on this address (e.g. :53)")
-	dnsZone := fs.String("dns-zone", "", "zone the DNS carrier answers for")
+	domain := fs.String("domain", "", "hostname (TLS SNI and DNS carrier zone when -dns)")
+	dns := fs.Bool("dns", false, "enable DNS carrier on :53 (zone = -domain)")
+	dnsListen := fs.String("dns-listen", "", "DNS carrier listen address (default :53 when -dns)")
 	admin := fs.String("admin-listen", "", "loopback address for /healthz and /metrics (default 127.0.0.1:9101)")
 	force := fs.Bool("force", false, "overwrite an existing config (regenerates the identity)")
 	if err := fs.Parse(args); err != nil {
@@ -192,8 +201,12 @@ func cmdInit(_ context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	dl := strings.TrimSpace(*dnsListen)
+	if *dns && dl == "" {
+		dl = ":53"
+	}
 	c := &config.Config{Listen: *listen, Decoy: *decoy, TLSCert: *cert, TLSKey: *key,
-		DNSListen: *dnsListen, DNSZone: *dnsZone, AdminListen: *admin, IdentityKey: auth.EncodeKey(priv)}
+		Domain: strings.TrimSpace(*domain), DNSListen: dl, AdminListen: *admin, IdentityKey: auth.EncodeKey(priv)}
 	c.Defaults()
 	if err := c.Validate(); err != nil {
 		return err
@@ -207,15 +220,19 @@ func cmdInit(_ context.Context, args []string) error {
 }
 
 // cmdEnroll registers the relay's identity with control and stores control's
-// public keys. The control URL is used once and never written to disk, so a
-// seized relay does not point at control.
+// public keys. Control URL override and beat mode are independent: curated
+// enroll defaults to no override + beat disabled (ADR-012 seizure posture).
 func cmdEnroll(ctx context.Context, args []string) error {
 	fs, cfg := flags("enroll")
 	ctrl := fs.String("control", defaultControlURL, "control public API URL (https; default "+defaultControlURL+")")
 	token := fs.String("token", "", "one-time enrollment token from the core admin API; \"-\" reads it from stdin")
 	pin := fs.String("pin", "", "base64 SHA-256 SPKI pin of control's TLS key, for a self-signed control")
 	addr := fs.String("addr", "", "public listen host:port to match the pending relay on control")
-	sni := fs.String("sni", "", "domain/SNI to match the pending relay on control")
+	domain := fs.String("domain", "", "domain to match the pending relay on control")
+	beatMode := fs.String("beat-mode", config.BeatDisabled, "beat mode: disabled|normal|conservative|telemetry (default disabled)")
+	storeCtrl := fs.Bool("store-control", false, "persist -control as control_url override (default: use built-in default at beat time)")
+	// Legacy -beat means normal mode + store control URL.
+	legacyBeat := fs.Bool("beat", false, "legacy: same as -beat-mode normal -store-control")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -243,30 +260,64 @@ func cmdEnroll(ctx context.Context, args []string) error {
 	if matchAddr == "" {
 		matchAddr = c.Listen
 	}
-	out, err := enroll(ctx, u, tok, *pin, priv.Public().(ed25519.PublicKey), matchAddr, *sni)
+	out, err := enroll(ctx, u, tok, *pin, priv.Public().(ed25519.PublicKey), matchAddr, *domain)
 	if err != nil {
 		return err
 	}
 	c.TrustedKeys = out.TrustedKeys
 	c.RelayID = out.RelayID
-	// Admin enroll never stores control's URL or pin (ADR-012 seizure posture).
-	c.ControlURL = ""
-	c.ControlPin = ""
+	if s := strings.TrimSpace(*domain); s != "" {
+		c.Domain = s
+	} else if s := strings.TrimSpace(out.Domain); s != "" {
+		c.Domain = s
+	}
+	if out.DNSCarrier && c.DNSListen == "" {
+		c.DNSListen = ":53"
+	}
+	mode := config.NormalizeBeatMode(*beatMode)
+	if *legacyBeat {
+		mode = config.BeatNormal
+		*storeCtrl = true
+	}
+	if err := config.ValidateBeatMode(mode); err != nil {
+		return err
+	}
+	c.BeatMode = mode
+	if *storeCtrl || *legacyBeat {
+		c.ControlURL = u.String()
+		c.ControlPin = *pin
+	} else {
+		// Seizure posture: no control URL on disk; runtime uses default when beating.
+		c.ControlURL = ""
+		c.ControlPin = ""
+		if mode != config.BeatDisabled && u.String() != defaultControlURL {
+			fmt.Println("warning: non-default -control used for enroll only; pass -store-control (or beat control -url) to beat that plane")
+		}
+	}
+	if mode != config.BeatDisabled && !config.PoolLive(mode) {
+		fmt.Println("warning: beat_mode", mode, "will not keep requires_beat relays in pools")
+	}
+	if mode == config.BeatNormal {
+		fmt.Println("note: enable requires_beat on control if this curated relay must stay in pools")
+	}
 	if err := config.Save(path, c); err != nil {
 		return err
 	}
 	fmt.Println("enrolled; trusted control keys:", len(out.TrustedKeys))
+	fmt.Println("beat_mode:", c.BeatMode)
+	resolved, _ := resolveControlURL(c.ControlURL)
+	fmt.Println("control:  ", resolved.String(), "(override="+boolStr(c.ControlURL != "")+")")
 	if out.RelayID != "" {
 		fmt.Println("relay_id:", out.RelayID)
 	}
 	if out.Addr != "" {
 		fmt.Println("addr:", out.Addr)
 	}
-	if out.SNI != "" {
-		fmt.Println("sni:", out.SNI)
+	if out.Domain != "" {
+		fmt.Println("domain:", out.Domain)
 	}
-	if out.DNSZone != "" {
-		fmt.Println("dns_zone:", out.DNSZone)
+	if out.DNSCarrier {
+		fmt.Println("dns_carrier: true (dns_listen=:53)")
 	}
 	return nil
 }
@@ -275,16 +326,15 @@ type enrollResult struct {
 	RelayID     string
 	TrustedKeys []string
 	Addr        string
-	SNI         string
-	DNSAddr     string
-	DNSZone     string
+	Domain      string
+	DNSCarrier  bool
 }
 
-func enroll(ctx context.Context, base *url.URL, token, pin string, pub ed25519.PublicKey, addr, sni string) (enrollResult, error) {
+func enroll(ctx context.Context, base *url.URL, token, pin string, pub ed25519.PublicKey, addr, domain string) (enrollResult, error) {
 	body, _ := json.Marshal(map[string]string{
 		"public_key": auth.EncodeKey(pub),
 		"addr":       addr,
-		"sni":        sni,
+		"domain":     domain,
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base.JoinPath("/v1/relays/enroll").String(), bytes.NewReader(body))
 	if err != nil {
@@ -303,7 +353,7 @@ func enroll(ctx context.Context, base *url.URL, token, pin string, pub ed25519.P
 		}
 		_ = json.NewDecoder(io.LimitReader(resp.Body, 512)).Decode(&er)
 		if er.Error == "" {
-			er.Error = "addr/sni does not match pending relay"
+			er.Error = "addr/domain does not match pending relay"
 		}
 		return enrollResult{}, fmt.Errorf("enrollment mismatch: %s", er.Error)
 	}
@@ -314,16 +364,15 @@ func enroll(ctx context.Context, base *url.URL, token, pin string, pub ed25519.P
 		RelayID     string   `json:"relay_id"`
 		TrustedKeys []string `json:"trusted_keys"`
 		Addr        string   `json:"addr"`
-		SNI         string   `json:"sni"`
-		DNSAddr     string   `json:"dns_addr"`
-		DNSZone     string   `json:"dns_zone"`
+		Domain      string   `json:"domain"`
+		DNSCarrier  bool     `json:"dns_carrier"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&out); err != nil || len(out.TrustedKeys) == 0 {
 		return enrollResult{}, errors.New("enrollment response invalid")
 	}
 	return enrollResult{
 		RelayID: out.RelayID, TrustedKeys: out.TrustedKeys,
-		Addr: out.Addr, SNI: out.SNI, DNSAddr: out.DNSAddr, DNSZone: out.DNSZone,
+		Addr: out.Addr, Domain: out.Domain, DNSCarrier: out.DNSCarrier,
 	}, nil
 }
 
@@ -366,14 +415,22 @@ func parseControlURL(raw string) (*url.URL, error) {
 	return u, nil
 }
 
+// resolveControlURL returns the override if set, otherwise the production default.
+func resolveControlURL(override string) (*url.URL, error) {
+	raw := strings.TrimSpace(override)
+	if raw == "" {
+		raw = defaultControlURL
+	}
+	return parseControlURL(raw)
+}
+
 // cmdRegister self-registers a community relay without an admin token.
 func cmdRegister(ctx context.Context, args []string) error {
 	fs, cfg := flags("register")
 	ctrl := fs.String("control", defaultControlURL, "control public API URL (https; default "+defaultControlURL+")")
 	port := fs.Int("port", 443, "public TCP port control should dial")
-	sni := fs.String("sni", "", "SNI clients and nodes present")
-	dnsPort := fs.Int("dns-port", 0, "optional DNS-shaped UDP port")
-	dnsZone := fs.String("dns-zone", "", "zone for the DNS carrier")
+	domain := fs.String("domain", "", "hostname clients and nodes present (TLS SNI)")
+	dns := fs.Bool("dns", false, "advertise DNS carrier on UDP :53 (zone = -domain)")
 	pin := fs.String("pin", "", "base64 SHA-256 SPKI pin of control's TLS key")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -387,11 +444,9 @@ func cmdRegister(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(*sni) == "" {
-		return errors.New("-sni required")
-	}
-	if (*dnsPort == 0) != (*dnsZone == "") {
-		return errors.New("-dns-port and -dns-zone go together")
+	dom := strings.TrimSpace(*domain)
+	if dom == "" {
+		return errors.New("-domain required")
 	}
 	priv, err := auth.DecodePrivateKey(c.IdentityKey)
 	if err != nil {
@@ -400,11 +455,15 @@ func cmdRegister(ctx context.Context, args []string) error {
 	pub := priv.Public().(ed25519.PublicKey)
 	pubStr := auth.EncodeKey(pub)
 	ts := time.Now().Unix()
-	msg := []byte(fmt.Sprintf("register|%s|%d|%s|%d|%s|%d", pubStr, *port, *sni, *dnsPort, *dnsZone, ts))
+	dnsFlag := 0
+	if *dns {
+		dnsFlag = 1
+	}
+	msg := []byte(fmt.Sprintf("register|%s|%d|%s|%d|%d", pubStr, *port, dom, dnsFlag, ts))
 	sig := base64.RawURLEncoding.EncodeToString(ed25519.Sign(priv, msg))
 	body, _ := json.Marshal(map[string]any{
-		"public_key": pubStr, "port": *port, "sni": *sni,
-		"dns_port": *dnsPort, "dns_zone": *dnsZone, "timestamp": ts, "signature": sig,
+		"public_key": pubStr, "port": *port, "domain": dom,
+		"dns": *dns, "timestamp": ts, "signature": sig,
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.JoinPath("/v1/relays/register").String(), bytes.NewReader(body))
 	if err != nil {
@@ -425,6 +484,7 @@ func cmdRegister(ctx context.Context, args []string) error {
 		Name        string   `json:"name"`
 		Status      string   `json:"status"`
 		TrustedKeys []string `json:"trusted_keys"`
+		Invite      string   `json:"invite"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil || out.RelayID == "" || len(out.TrustedKeys) == 0 {
 		return errors.New("registration response invalid")
@@ -434,6 +494,11 @@ func cmdRegister(ctx context.Context, args []string) error {
 	c.Name = out.Name
 	c.ControlURL = u.String()
 	c.ControlPin = *pin
+	c.BeatMode = config.BeatNormal // community needs pool liveness
+	c.Domain = dom
+	if *dns {
+		c.DNSListen = ":53"
+	}
 	if err := config.Save(path, c); err != nil {
 		return err
 	}
@@ -441,13 +506,23 @@ func cmdRegister(ctx context.Context, args []string) error {
 	fmt.Println("relay_id:", out.RelayID)
 	fmt.Println("name:", out.Name)
 	fmt.Println("status:", out.Status)
-	fmt.Println("relay link: dotvpn-relay://" + out.RelayID)
+	fmt.Println("domain:", c.Domain)
+	if c.DNSListen != "" {
+		fmt.Println("dns_listen:", c.DNSListen)
+	}
+	fmt.Println("beat_mode:", c.BeatMode, "(required for community pool membership)")
+	if out.Invite != "" {
+		fmt.Println("relay link:", out.Invite)
+	} else {
+		fmt.Println("relay link:", relayInviteURI(out.RelayID))
+	}
 	return nil
 }
 
 func cmdRun(ctx context.Context, args []string) error {
 	fs, cfg := flags("run")
-	noBeat := fs.Bool("no-beat", false, "do not send telemetry beats to control")
+	beatMode := fs.String("beat-mode", "", "override config beat_mode for this process (disabled|normal|conservative|telemetry)")
+	noBeat := fs.Bool("no-beat", false, "legacy: same as -beat-mode disabled")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -455,10 +530,19 @@ func cmdRun(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return serve(ctx, c, !*noBeat)
+	if *noBeat {
+		c.BeatMode = config.BeatDisabled
+	}
+	if *beatMode != "" {
+		if err := config.ValidateBeatMode(*beatMode); err != nil {
+			return err
+		}
+		c.BeatMode = config.NormalizeBeatMode(*beatMode)
+	}
+	return serve(ctx, c)
 }
 
-func serve(ctx context.Context, c *config.Config, beat bool) error {
+func serve(ctx context.Context, c *config.Config) error {
 	priv, err := auth.DecodePrivateKey(c.IdentityKey)
 	if err != nil {
 		return errors.New("identity_key invalid: run `" + prog() + " init`")
@@ -488,7 +572,15 @@ func serve(ctx context.Context, c *config.Config, beat bool) error {
 		fallback, stop = relay.Builtin(cert)
 		defer stop()
 	}
-	srv, err := relay.New(relay.Options{Identity: priv, Verifier: auth.NewVerifier(pubs...), Fallback: fallback, MaxConns: c.MaxConns})
+	srv, err := relay.New(relay.Options{
+		Identity: priv, Verifier: auth.NewVerifier(pubs...), Fallback: fallback,
+		MaxConns: c.MaxConns, MaxPoolPerNode: c.MaxPoolPerNode, MaxPool: c.MaxPool,
+		Bandwidth: relay.BandwidthOpts{
+			IngressMbps: c.BandwidthIngressMbps, EgressMbps: c.BandwidthEgressMbps,
+			AvgWindow: c.AvgWindow(), AvgCapMbps: c.BandwidthAvgCapMbps,
+			ThrottleMbps: c.BandwidthThrottleMbps,
+		},
+	})
 	if err != nil {
 		return err
 	}
@@ -507,26 +599,46 @@ func serve(ctx context.Context, c *config.Config, beat bool) error {
 		if err != nil {
 			return err
 		}
-		go func() { errc <- srv.ServeDNS(ctx, pc, c.DNSZone) }()
+		go func() { errc <- srv.ServeDNS(ctx, pc, c.Domain) }()
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprintln(w, "ok") })
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 		parked := metricName(prog(), "parked")
 		active := metricName(prog(), "active")
+		bytesIn := metricName(prog(), "bytes_in")
+		bytesOut := metricName(prog(), "bytes_out")
+		sessions := metricName(prog(), "sessions")
+		inRate := metricName(prog(), "ingress_bps")
+		outRate := metricName(prog(), "egress_bps")
+		throttled := metricName(prog(), "bandwidth_throttled")
 		fmt.Fprintf(w, "# TYPE %s gauge\n%s %d\n# TYPE %s gauge\n%s %d\n",
 			parked, parked, srv.Parked(), active, active, srv.Active())
+		fmt.Fprintf(w, "# TYPE %s counter\n%s %d\n# TYPE %s counter\n%s %d\n# TYPE %s counter\n%s %d\n",
+			bytesIn, bytesIn, srv.BytesIn(), bytesOut, bytesOut, srv.BytesOut(),
+			sessions, sessions, srv.Sessions())
+		inBps, outBps := srv.BandwidthRates()
+		th := 0
+		if srv.BandwidthThrottled() {
+			th = 1
+		}
+		fmt.Fprintf(w, "# TYPE %s gauge\n%s %d\n# TYPE %s gauge\n%s %d\n# TYPE %s gauge\n%s %d\n",
+			inRate, inRate, inBps, outRate, outRate, outBps, throttled, throttled, th)
 	})
 	hs := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ErrorLog: slog.NewLogLogger(slog.DiscardHandler, slog.LevelError)}
 	go func() { <-ctx.Done(); _ = hs.Close() }()
 	go func() { _ = hs.Serve(adm) }()
-	if beat && c.ControlURL != "" && c.RelayID != "" {
-		if _, err := parseControlURL(c.ControlURL); err != nil {
+	base, jitter, beatOK := config.BeatInterval(c.BeatMode)
+	if beatOK && c.RelayID != "" {
+		if _, err := resolveControlURL(c.ControlURL); err != nil {
 			return fmt.Errorf("control_url: %w", err)
 		}
-		go beatLoop(ctx, c, priv, srv, log)
+		if !config.PoolLive(c.BeatMode) {
+			log.Info("beat mode is telemetry-only; will not keep requires_beat relays in pools", "mode", c.BeatMode)
+		}
+		go beatLoop(ctx, c, priv, srv, log, base, jitter)
 	}
-	log.Info("started")
+	log.Info("started", "beat_mode", c.BeatMode)
 	select {
 	case <-ctx.Done():
 		return nil
@@ -535,34 +647,43 @@ func serve(ctx context.Context, c *config.Config, beat bool) error {
 	}
 }
 
-func beatLoop(ctx context.Context, c *config.Config, priv ed25519.PrivateKey, srv *relay.Server, log *slog.Logger) {
-	base, err := parseControlURL(c.ControlURL)
+func beatLoop(ctx context.Context, c *config.Config, priv ed25519.PrivateKey, srv *relay.Server, log *slog.Logger, base, jitter time.Duration) {
+	resolved, err := resolveControlURL(c.ControlURL)
 	if err != nil {
-		log.Warn("beat disabled: control_url invalid", "err", err)
+		log.Warn("beat disabled: control URL invalid", "err", err)
 		return
 	}
 	pub := auth.EncodeKey(priv.Public().(ed25519.PublicKey))
-	interval := 30*time.Second + time.Duration(rand.Int64N(int64(15*time.Second)))
+	interval := base
+	if jitter > 0 {
+		interval = base + time.Duration(rand.Int64N(int64(jitter)))
+	}
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	send := func() {
 		ts := time.Now().Unix()
 		parked := srv.Parked()
 		active := srv.Active()
-		msg := []byte(fmt.Sprintf("beat|%s|%s|%d|%d|%d", c.RelayID, version, parked, active, ts))
+		bytesIn := int64(srv.BytesIn())
+		bytesOut := int64(srv.BytesOut())
+		sessions := int64(srv.Sessions())
+		msg := []byte(fmt.Sprintf("beat|%s|%s|%d|%d|%d|%d|%d|%d",
+			c.RelayID, version, parked, active, bytesIn, bytesOut, sessions, ts))
 		sig := base64.RawURLEncoding.EncodeToString(ed25519.Sign(priv, msg))
 		body, _ := json.Marshal(map[string]any{
 			"relay_id": c.RelayID, "public_key": pub, "version": version,
-			"parked": parked, "active": active, "timestamp": ts, "signature": sig,
+			"parked": parked, "active": active,
+			"bytes_in": bytesIn, "bytes_out": bytesOut, "sessions": sessions,
+			"timestamp": ts, "signature": sig,
 		})
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, base.JoinPath("/v1/relays/beat").String(), bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, resolved.JoinPath("/v1/relays/beat").String(), bytes.NewReader(body))
 		if err != nil {
 			return
 		}
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := controlClient(c.ControlPin).Do(req)
 		if err != nil {
-			log.Debug("beat failed", "err", err)
+			log.Warn("beat failed", "err", err)
 			return
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {

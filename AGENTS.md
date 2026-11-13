@@ -14,7 +14,7 @@ go test -race -count=1 ./...
 ## Invariants
 
 - Holds no client or admin code. Do not import anything that belongs to core or client.
-- Stores no secrets beyond its own identity key and control's public key; no static shared key (ADR-012, ADR-013). Admin `enroll` never writes control's URL. Community `register` may write `control_url` / `control_pin` for optional beats; `run -no-beat` turns beats off.
+- Stores no secrets beyond its own identity key and control's public key; no static shared key (ADR-012, ADR-013). `control_url` is an optional override (empty → ctrl.dotvpn.org/api); `beat_mode` is the beat switch (ADR-024). Admin `enroll` defaults to no override + `disabled`. Community `register` stores the URL used and `beat_mode=normal`.
 - No access logs, no client IPs, no version banner, no domains or keys in errors or metrics.
 - Unauthenticated, invalid, replayed or probing connections are replayed byte for byte to the decoy, never closed or reset; timing stays uniform (ADR-014).
 - The built-in decoy is for tests. Production runs `-decoy` in front of a real web server (ADR-015).

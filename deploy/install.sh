@@ -3,8 +3,8 @@
 #
 # Non-interactive (safe for curl|bash; pass all required flags):
 #   curl -fsSL …/deploy/install.sh | sudo ENROLL_TOKEN=… bash -s -- --decoy 127.0.0.1:8443
-#     (token loads listen/domain/dns from control; pass --listen/--sni to override)
-#   curl -fsSL …/deploy/install.sh | sudo bash -s -- --register --sni relay.example.com \
+#     (token loads listen/domain/dns from control; pass --listen/--domain to override)
+#   curl -fsSL …/deploy/install.sh | sudo bash -s -- --register --domain relay.example.com \
 #     --decoy 127.0.0.1:8443 --listen PUBLIC_IP:443
 #
 # Interactive (download first so stdin is a TTY):
@@ -12,26 +12,35 @@
 #
 # Flags: --control DOMAIN   control domain (default ctrl.dotvpn.org). Full
 #                           https://…/api URLs are accepted and normalized.
-#        --register         community self-registration (no admin token; needs --sni)
-#        --sni HOST         domain/SNI clients and nodes present (required with --register;
-#                           recommended with curated enroll so control can match)
+#        --register         community self-registration (no admin token; needs --domain)
+#        --donate           list this community relay publicly after registration
+#        --email ADDRESS    operator notification email (community registration)
+#        --domain HOST      hostname (TLS SNI and DNS carrier zone when enabled;
+#                           required with --register; recommended with curated enroll)
 #        --pin PIN          base64 SHA-256 SPKI pin for a self-signed control
 #        --decoy HOST:PORT  your real TLS web server (required unless --setup-decoy)
-#        --setup-decoy      guided system Caddy/nginx on loopback for --sni
+#        --setup-decoy      guided system Caddy/nginx on loopback for --domain
 #        --listen ADDR      public listen address (host:port or :port; default PUBLIC_IP:443)
-#        --dns-zone Z       enable the DNS carrier on :53 for zone Z (off by default)
-#        --require-dns      fail if --sni does not resolve to this host
+#        --dns-carrier      enable the DNS carrier on :53 (zone = --domain; off by default)
+#        --require-dns      fail if --domain does not resolve to this host
 #        --init-only        install binary+config without enroll/register/start
 #        --lowkey           neutral build; every name derives from --name (see ADR-016)
 #        --name N           lowkey install name (random if omitted, printed at the end)
 #        --quiet-logs       journald LogLevelMax=warning for the unit
-#        --no-beat          disable telemetry beats after community register
+#        --beat-mode MODE   disabled|normal|conservative|telemetry
+#                           (curated default disabled; community default normal)
+#        --no-beat          same as --beat-mode disabled
+#        --store-control    curated: persist --control as control_url override
+#        --bw-ingress Mbps  app-level ingress cap (peer→relay; 0=unlimited)
+#        --bw-egress Mbps   app-level egress cap (relay→peer; 0=unlimited)
+#        --bw-avg-cap Mbps  24h average soft-cap (requires --bw-throttle)
+#        --bw-throttle Mbps sustained Mbps when 24h average soft-cap engages
 #        --version vX.Y.Z   release to install (default latest)
 #        --from-dir DIR     use binaries and checksums.txt from DIR instead of downloading
 #        --token-stdin      read the enrollment token from stdin (else ENROLL_TOKEN, else a prompt)
 #        --non-interactive  never prompt (implied when stdin is not a TTY or CI is set)
 #        --fix-resolved    disable systemd-resolved DNSStubListener (free UDP/53)
-#        --skip-dns-carrier clear dns_zone when UDP/53 conflicts (non-interactive)
+#        --skip-dns-carrier disable DNS carrier when UDP/53 conflicts (non-interactive)
 #        --create-swap      create a 1GiB /swapfile when none exists
 #        --no-swap          do not create swap (default in non-interactive)
 #        --setup-firewall   enable ufw (if present) and open relay ports
@@ -42,7 +51,9 @@
 # binary only relative to checksums.txt; when cosign is installed (or
 # REQUIRE_COSIGN=1), the installer verifies checksums.txt.sigstore.json.
 # Upgrade, rollback and uninstall need the same --lowkey/--name as the install.
-# Curated enroll never stores --control. Community --register stores it for beats.
+# Control URL and beat mode are independent. Curated enroll defaults to no
+# control_url override + beat disabled (ADR-012). Community register stores
+# control_url and defaults beat_mode=normal for pool liveness.
 # Decoy is the operator's real site (ADR-015/016). --setup-decoy may install a
 # system Caddy/nginx for the operator domain; Caddy is never embedded in the binary.
 set -euo pipefail
@@ -51,7 +62,10 @@ REPO="${RELAY_REPO:-payam-foundation/dotvpn-relay}"
 CONTROL_DOMAIN="ctrl.dotvpn.org"
 CONTROL_MOUNT="/api"
 CONTROL="https://${CONTROL_DOMAIN}${CONTROL_MOUNT}"
-PIN="" DECOY="" LISTEN="" DNS_ZONE="" SNI="" REGISTER=0 NO_BEAT=0
+PIN="" DECOY="" LISTEN="" DOMAIN="" EMAIL="" REGISTER=0 DONATE=0
+DNS_CARRIER=0 DNS_CARRIER_SET=0
+BEAT_MODE="" BEAT_MODE_SET=0 STORE_CONTROL=0
+BW_INGRESS="" BW_EGRESS="" BW_AVG_CAP="" BW_THROTTLE=""
 LOWKEY=0 NAME="" QUIET=0
 VERSION=latest FROM_DIR="" TOKEN_STDIN=0 ACTION=install START=1 FIREWALL=1
 NONINTERACTIVE=0 PURGE_FW=0 LISTEN_SET=0 REGISTER_SET=0 CONTROL_SET=0
@@ -81,18 +95,26 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --control) need "$@"; set_control_domain "$2"; CONTROL_SET=1; shift 2 ;;
     --register) REGISTER=1; REGISTER_SET=1; shift ;;
-    --sni) need "$@"; SNI=$2; shift 2 ;;
+    --donate) DONATE=1; shift ;;
+    --email) need "$@"; EMAIL=$2; shift 2 ;;
+    --domain) need "$@"; DOMAIN=$2; shift 2 ;;
+    --dns-carrier) DNS_CARRIER=1; DNS_CARRIER_SET=1; shift ;;
     --pin) need "$@"; PIN=$2; shift 2 ;;
     --decoy) need "$@"; DECOY=$2; shift 2 ;;
     --setup-decoy) SETUP_DECOY=1; shift ;;
     --listen) need "$@"; LISTEN=$2; LISTEN_SET=1; shift 2 ;;
-    --dns-zone) need "$@"; DNS_ZONE=$2; shift 2 ;;
     --require-dns) REQUIRE_DNS=1; shift ;;
     --init-only) INIT_ONLY=1; START=0; shift ;;
     --lowkey) LOWKEY=1; shift ;;
     --name) need "$@"; NAME=$2; shift 2 ;;
     --quiet-logs) QUIET=1; shift ;;
-    --no-beat) NO_BEAT=1; shift ;;
+    --beat-mode) need "$@"; BEAT_MODE=$2; BEAT_MODE_SET=1; shift 2 ;;
+    --no-beat) BEAT_MODE=disabled; BEAT_MODE_SET=1; shift ;;
+    --store-control) STORE_CONTROL=1; shift ;;
+    --bw-ingress) need "$@"; BW_INGRESS=$2; shift 2 ;;
+    --bw-egress) need "$@"; BW_EGRESS=$2; shift 2 ;;
+    --bw-avg-cap) need "$@"; BW_AVG_CAP=$2; shift 2 ;;
+    --bw-throttle) need "$@"; BW_THROTTLE=$2; shift 2 ;;
     --version) need "$@"; VERSION=$2; shift 2 ;;
     --from-dir) need "$@"; FROM_DIR=$2; shift 2 ;;
     --token-stdin) TOKEN_STDIN=1; shift ;;
@@ -265,7 +287,7 @@ this_host_ips() {
 check_domain_dns() {
   local host=$1 ips ip match=0 any=0 pub locals
   [ -n "$host" ] || return 0
-  printf '%s' "$host" | grep -Eq '^[A-Za-z0-9.-]+$' || die "domain/SNI looks invalid: $host"
+  printf '%s' "$host" | grep -Eq '^[A-Za-z0-9.-]+$' || die "domain looks invalid: $host"
   locals=$(this_host_ips)
   pub=$(detect_public_ip)
   [ -n "$pub" ] || pub=$(detect_any_ipv4)
@@ -302,6 +324,34 @@ check_domain_dns() {
   elif [ "$any" -eq 1 ]; then
     warn "could not detect this host's IP to compare with $host → $ips"
   fi
+  check_domain_tls "$host"
+}
+
+# Live TLS handshake with SNI against this host's listen address (or first resolved IP).
+check_domain_tls() {
+  local host=$1 port target tip
+  [ -n "$host" ] || return 0
+  command -v openssl >/dev/null || { warn "openssl missing; skip live TLS check for $host"; return 0; }
+  port=$(listen_port)
+  tip=$(resolve_host_ips "$host" | head -n1)
+  if [ -n "$tip" ]; then
+    target="${tip}:${port}"
+  else
+    target="${host}:${port}"
+  fi
+  if printf '' | openssl s_client -connect "$target" -servername "$host" -brief </dev/null 2>/dev/null | grep -qiE 'Protocol version|CONNECTION ESTABLISHED|Verification'; then
+    log "TLS SNI $host ok on $target"
+    return 0
+  fi
+  # Older openssl without -brief: accept a certificate dump as handshake success.
+  if printf '' | openssl s_client -connect "$target" -servername "$host" </dev/null 2>/dev/null | grep -q 'BEGIN CERTIFICATE'; then
+    log "TLS SNI $host ok on $target"
+    return 0
+  fi
+  if [ "$REQUIRE_DNS" -eq 1 ] || [ "$NONINTERACTIVE" -eq 0 ]; then
+    die "TLS handshake with SNI=$host to $target failed; decoy/relay must answer on :$port for that domain"
+  fi
+  warn "TLS handshake with SNI=$host to $target failed (continuing; pass --require-dns to fail hard)"
 }
 
 # Strip whitespace/newlines so a hard-wrapped TUI token still works when pasted.
@@ -309,17 +359,22 @@ normalize_enroll_token() {
   ENROLL_TOKEN=$(printf '%s' "${ENROLL_TOKEN:-}" | tr -d '[:space:]')
 }
 
-# Loads addr/sni/dns from a curated enroll token without consuming it.
-# Fills empty LISTEN/SNI/DNS_ZONE so the installer does not re-ask core answers.
+# Loads addr/domain/dns_carrier from a curated enroll token without consuming it.
+# Fills empty LISTEN/DOMAIN/DNS_CARRIER so the installer does not re-ask core answers.
 apply_enroll_pending() {
   [ "$REGISTER" -eq 0 ] || return 0
   normalize_enroll_token
   [ -n "${ENROLL_TOKEN:-}" ] || return 0
   command -v curl >/dev/null || die "curl is required to load pending relay metadata from the enroll token"
   command -v python3 >/dev/null || die "python3 is required to parse pending relay metadata from control"
-  local url="${CONTROL%/}/v1/relays/enroll/pending" tmp http json parsed p_addr p_sni p_zone name hint=""
+  local url="${CONTROL%/}/v1/relays/enroll/pending" tmp http json parsed p_addr p_domain p_dns name hint=""
+  local curl_pin=()
+  if [ -n "$PIN" ]; then
+    curl_pin=(--pinnedpubkey "sha256//${PIN}")
+  fi
   tmp=$(mktemp)
   http=$(curl -sS -o "$tmp" -w '%{http_code}' --max-time 20 \
+    "${curl_pin[@]}" \
     -H "Authorization: Bearer ${ENROLL_TOKEN}" -H "Accept: application/json" "$url" 2>/dev/null || printf '000')
   if [ "$http" != "200" ]; then
     if [ "$http" = "401" ]; then
@@ -334,34 +389,42 @@ apply_enroll_pending() {
   rm -f "$tmp"
   parsed=$(printf '%s' "$json" | python3 -c 'import json,sys
 d=json.load(sys.stdin)
-for k in ("addr","sni","dns_zone","name"):
-    print(d.get(k) or "")')
+print(d.get("addr") or "")
+print(d.get("domain") or "")
+print("1" if d.get("dns_carrier") else "")
+print(d.get("name") or "")')
   {
     IFS= read -r p_addr
-    IFS= read -r p_sni
-    IFS= read -r p_zone
+    IFS= read -r p_domain
+    IFS= read -r p_dns
     IFS= read -r name
   } <<< "$parsed"
-  if [ -z "$p_addr" ] || [ -z "$p_sni" ]; then
-    die "pending relay response missing addr/sni from $url"
+  if [ -z "$p_addr" ] || [ -z "$p_domain" ]; then
+    die "pending relay response missing addr/domain from $url"
   fi
   if [ "$LISTEN_SET" -eq 0 ] || [ -z "$LISTEN" ]; then
     LISTEN=$p_addr
     LISTEN_SET=1
   fi
-  if [ -z "$SNI" ]; then
-    SNI=$p_sni
+  if [ -z "$DOMAIN" ]; then
+    DOMAIN=$p_domain
   fi
-  if [ -z "$DNS_ZONE" ] && [ -n "$p_zone" ]; then
-    DNS_ZONE=$p_zone
+  if [ "$DNS_CARRIER_SET" -eq 0 ] && [ -n "$p_dns" ]; then
+    DNS_CARRIER=1
+    DNS_CARRIER_SET=1
   fi
-  log "from enroll token: name=${name:--} listen=$LISTEN domain=$SNI dns_zone=${DNS_ZONE:--}"
+  log "from enroll token: name=${name:--} listen=$LISTEN domain=$DOMAIN dns_carrier=$([ "$DNS_CARRIER" -eq 1 ] && echo on || echo off)"
 }
 
 check_control_reachable() {
   local url="${CONTROL%/}/healthz" code body
+  local curl_pin=()
+  if [ -n "$PIN" ]; then
+    curl_pin=(--pinnedpubkey "sha256//${PIN}")
+  fi
   body=$(mktemp)
-  code=$(curl -sS -o "$body" -w '%{http_code}' --max-time 15 "$url" 2>/dev/null || printf '000')
+  code=$(curl -sS -o "$body" -w '%{http_code}' --max-time 15 \
+    "${curl_pin[@]}" "$url" 2>/dev/null || printf '000')
   if [ "$code" != "200" ] || ! grep -qi '^ok' "$body"; then
     rm -f "$body"
     die "control not reachable at $url (HTTP ${code}). Check DNS/TLS for ${CONTROL_DOMAIN} and that core mount is /api"
@@ -405,28 +468,28 @@ EOF
 }
 
 check_dns_carrier() {
-  [ -n "$DNS_ZONE" ] || return 0
-  printf '%s' "$DNS_ZONE" | grep -Eq '^[A-Za-z0-9.-]+$' || die "dns-zone looks invalid: $DNS_ZONE"
+  [ "$DNS_CARRIER" -eq 1 ] || return 0
+  [ -n "$DOMAIN" ] || die "--dns-carrier needs --domain"
   if [ "$SKIP_DNS_CARRIER" -eq 1 ]; then
     log "skipping DNS carrier (--skip-dns-carrier)"
-    DNS_ZONE=""
+    DNS_CARRIER=0
     return 0
   fi
   if ! udp53_has_any; then
-    log "DNS carrier zone=$DNS_ZONE (UDP/53 free — protocol suffix, not authoritative DNS)"
+    log "DNS carrier on (zone=$DOMAIN, UDP/53 free — protocol tunnel, not authoritative DNS)"
     return 0
   fi
   if udp53_has_nonstub; then
-    die "UDP/53 is in use by a non-stub listener; free it, pass --skip-dns-carrier, or omit dns-zone"
+    die "UDP/53 is in use by a non-stub listener; free it, pass --skip-dns-carrier, or omit --dns-carrier"
   fi
   # Only the systemd-resolved stub is listening.
   if [ "$FIX_RESOLVED" -eq 1 ]; then
     fix_systemd_resolved_stub
-    log "DNS carrier zone=$DNS_ZONE (UDP/53 free after resolved fix)"
+    log "DNS carrier on (zone=$DOMAIN, UDP/53 free after resolved fix)"
     return 0
   fi
   if [ "$NONINTERACTIVE" -eq 1 ]; then
-    die "UDP/53 held by systemd-resolved stub: pass --fix-resolved, --skip-dns-carrier, or omit dns-zone"
+    die "UDP/53 held by systemd-resolved stub: pass --fix-resolved, --skip-dns-carrier, or omit --dns-carrier"
   fi
   local choice=""
   menu choice "UDP/53 is held by systemd-resolved (stub on 127.0.0.53). DNS carrier needs :53." \
@@ -435,10 +498,10 @@ check_dns_carrier() {
     "abort"
   case "$choice" in
     fix*) fix_systemd_resolved_stub ;;
-    skip*) DNS_ZONE=""; log "DNS carrier skipped" ;;
+    skip*) DNS_CARRIER=0; log "DNS carrier skipped" ;;
     *) die "aborted" ;;
   esac
-  [ -z "$DNS_ZONE" ] || log "DNS carrier zone=$DNS_ZONE (UDP/53 free — protocol suffix, not authoritative DNS)"
+  [ "$DNS_CARRIER" -eq 0 ] || log "DNS carrier on (zone=$DOMAIN, UDP/53 free — protocol tunnel, not authoritative DNS)"
 }
 
 kb_avail() {
@@ -614,7 +677,7 @@ validate_decoy_tls() {
   host=$DECOY_HOST; port=$DECOY_PORT
   (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null || die "nothing answers on $DECOY: start the web server or use guided decoy setup"
   if command -v openssl >/dev/null; then
-    openssl s_client -connect "$host:$port" -servername "${SNI:-localhost}" </dev/null 2>/dev/null | grep -q 'BEGIN CERTIFICATE' \
+    openssl s_client -connect "$host:$port" -servername "${DOMAIN:-localhost}" </dev/null 2>/dev/null | grep -q 'BEGIN CERTIFICATE' \
       || die "decoy $DECOY did not complete a TLS handshake"
   fi
 }
@@ -703,7 +766,7 @@ EOF
 
 run_guided_decoy() {
   local domain=$1 choice="caddy" root
-  [ -n "$domain" ] || die "guided decoy needs a domain (--sni)"
+  [ -n "$domain" ] || die "guided decoy needs a domain (--domain)"
   root="${DECOY_SITE_ROOT:-/var/www/$domain}"
   if [ "$NONINTERACTIVE" -eq 0 ]; then
     prompt root "Site root directory for decoy content" "$root"
@@ -740,7 +803,7 @@ show_host_ip_hint() {
 interactive_fill() {
   [ "$ACTION" = install ] || return 0
   [ "$NONINTERACTIVE" -eq 0 ] || return 0
-  local mode_choice="" cand="" decoy_choice="" adv_choice="" listen_choice="" stack="" curated_from_token=0
+  local mode_choice="" cand="" decoy_choice="" adv_choice="" listen_choice="" stack="" curated_from_token=0 donation_choice=""
   echo > /dev/tty
   printf '%s\n' "Dot VPN relay installer" > /dev/tty
   printf '%s\n' "Curated: create the relay in core first, then paste only the one-time token here." > /dev/tty
@@ -776,9 +839,9 @@ interactive_fill() {
   if [ "$curated_from_token" -eq 0 ]; then
     show_host_ip_hint
     echo > /dev/tty
-    if [ -z "$SNI" ]; then
-      prompt SNI "Domain / SNI (DNS-only A/AAAA to this host)" ""
-      [ -n "$SNI" ] || die "domain/SNI is required"
+    if [ -z "$DOMAIN" ]; then
+      prompt DOMAIN "Domain (DNS-only A/AAAA to this host; TLS SNI + DNS zone)" ""
+      [ -n "$DOMAIN" ] || die "domain is required"
     fi
     if [ "$LISTEN_SET" -eq 0 ]; then
       cand=$(detect_public_ip)
@@ -812,16 +875,72 @@ interactive_fill() {
       *) prompt DECOY "Decoy HOST:PORT" "127.0.0.1:8443" ;;
     esac
   fi
-  # DNS carrier is advanced; curated tokens already carry dns_zone when set on core.
-  if [ -z "$DNS_ZONE" ] && [ "$curated_from_token" -eq 0 ]; then
-    menu adv_choice "Advanced options" "none (recommended)" "DNS carrier (UDP/53 protocol tunnel)"
+  # DNS carrier is advanced; curated tokens already carry dns_carrier when set on core.
+  if [ "$DNS_CARRIER_SET" -eq 0 ] && [ "$curated_from_token" -eq 0 ]; then
+    menu adv_choice "Advanced options" "none (recommended)" "DNS carrier (UDP/53, same domain)"
     if [[ "$adv_choice" == DNS* ]]; then
-      prompt DNS_ZONE "DNS carrier zone suffix (e.g. carrier.example.com)" ""
-      [ -n "$DNS_ZONE" ] || die "dns zone required when enabling the DNS carrier"
+      DNS_CARRIER=1
+      DNS_CARRIER_SET=1
+      : # domain already set
     fi
   fi
+  if [ "$REGISTER" -eq 1 ]; then
+    menu donation_choice "Relay visibility" \
+      "private (invite link only)" \
+      "donate capacity to the public network"
+    case "$donation_choice" in
+      donate*) DONATE=1 ;;
+      *) DONATE=0 ;;
+    esac
+    prompt EMAIL "Notification email (optional)" "$EMAIL"
+  fi
+  if [ "$BEAT_MODE_SET" -eq 0 ]; then
+    printf '%s\n' "Beat mode is independent of the control domain." > /dev/tty
+    printf '%s\n' "Only 'normal' (~45–75s) keeps community / requires_beat relays in pools." > /dev/tty
+    if [ "$REGISTER" -eq 1 ]; then
+      menu BEAT_MODE "Beat mode" \
+        "normal (recommended for community pool membership)" \
+        "disabled" \
+        "conservative (1h telemetry; not pool-live)" \
+        "telemetry (12h; not pool-live)"
+    else
+      menu BEAT_MODE "Beat mode" \
+        "disabled (default; seizure-friendly)" \
+        "normal (~45–75s; set requires_beat on control for pools)" \
+        "conservative (1h telemetry)" \
+        "telemetry (12h)"
+    fi
+    case "$BEAT_MODE" in
+      normal*) BEAT_MODE=normal ;;
+      conservative*) BEAT_MODE=conservative ;;
+      telemetry*) BEAT_MODE=telemetry ;;
+      *) BEAT_MODE=disabled ;;
+    esac
+    BEAT_MODE_SET=1
+  fi
+  if [ "$REGISTER" -eq 0 ] && [ "$BEAT_MODE" != "disabled" ] && [ "$CONTROL_DOMAIN" != "ctrl.dotvpn.org" ]; then
+    local sc=y
+    prompt sc "Persist control URL override for beats? (needed for non-default control)" "y"
+    case "$sc" in y|Y|yes|YES) STORE_CONTROL=1 ;; esac
+  fi
+  local bw_ask=n
+  prompt bw_ask "Set app-level bandwidth caps? (ingress/egress Mbps)" "n"
+  case "$bw_ask" in
+    y|Y|yes|YES)
+      prompt BW_INGRESS "Ingress Mbps (peer→relay; 0=unlimited)" "${BW_INGRESS:-0}"
+      prompt BW_EGRESS "Egress Mbps (relay→peer; 0=unlimited)" "${BW_EGRESS:-0}"
+      local avg_ask=n
+      prompt avg_ask "Enable 24h average soft-cap (DC throttle pattern)?" "n"
+      case "$avg_ask" in
+        y|Y|yes|YES)
+          prompt BW_AVG_CAP "24h average cap Mbps" "${BW_AVG_CAP:-100}"
+          prompt BW_THROTTLE "Throttle to Mbps when over average" "${BW_THROTTLE:-100}"
+          ;;
+      esac
+      ;;
+  esac
   echo
-  log "summary: mode=$([ "$REGISTER" -eq 1 ] && echo register || echo enroll) decoy=${DECOY:-guided} listen=${LISTEN:-:443} sni=${SNI:--} dns_zone=${DNS_ZONE:--} control=$CONTROL"
+  log "summary: mode=$([ "$REGISTER" -eq 1 ] && echo register || echo enroll) visibility=$([ "$DONATE" -eq 1 ] && echo donated || echo private) email=${EMAIL:--} decoy=${DECOY:-guided} listen=${LISTEN:-:443} domain=${DOMAIN:--} dns_carrier=$([ "$DNS_CARRIER" -eq 1 ] && echo on || echo off) control=$CONTROL beat=$BEAT_MODE bw_in=${BW_INGRESS:--} bw_out=${BW_EGRESS:--}"
   local ok=y
   prompt ok "Proceed?" "y"
   case "$ok" in y|Y|yes|YES) ;; *) die "aborted" ;; esac
@@ -966,7 +1085,6 @@ write_unit() {
   local desc="dotvpn relay" extra="" run_flags="-config $CONF"
   [ "$LOWKEY" -eq 1 ] && desc="$NAME"
   [ "$QUIET" -eq 1 ] && extra="LogLevelMax=warning"
-  [ "$NO_BEAT" -eq 1 ] && run_flags="$run_flags -no-beat"
   cat >"$UNIT_FILE" <<EOF
 [Unit]
 Description=$desc
@@ -1017,15 +1135,15 @@ open_ports() {
   port=${port:-443}
   if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
     ufw allow "$port/tcp" >/dev/null
-    [ -n "$DNS_ZONE" ] && ufw allow 53/udp >/dev/null
-    printf '%s\n' "$port/tcp" ${DNS_ZONE:+53/udp} >"$CONF_DIR/firewall.ports"
-    log "opened $port/tcp${DNS_ZONE:+ and 53/udp} in ufw (uninstall keeps rules unless --purge-firewall)"
+    [ "$DNS_CARRIER" -eq 1 ] && ufw allow 53/udp >/dev/null
+    printf '%s\n' "$port/tcp" $([ "$DNS_CARRIER" -eq 1 ] && echo 53/udp) >"$CONF_DIR/firewall.ports"
+    log "opened $port/tcp$([ "$DNS_CARRIER" -eq 1 ] && echo ' and 53/udp') in ufw (uninstall keeps rules unless --purge-firewall)"
   elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
-    firewall-cmd -q --permanent --add-port="$port/tcp" ${DNS_ZONE:+--add-port=53/udp} && firewall-cmd -q --reload
-    printf '%s\n' "$port/tcp" ${DNS_ZONE:+53/udp} >"$CONF_DIR/firewall.ports"
-    log "opened $port/tcp${DNS_ZONE:+ and 53/udp} in firewalld (uninstall keeps rules unless --purge-firewall)"
+    firewall-cmd -q --permanent --add-port="$port/tcp" $([ "$DNS_CARRIER" -eq 1 ] && echo --add-port=53/udp) && firewall-cmd -q --reload
+    printf '%s\n' "$port/tcp" $([ "$DNS_CARRIER" -eq 1 ] && echo 53/udp) >"$CONF_DIR/firewall.ports"
+    log "opened $port/tcp$([ "$DNS_CARRIER" -eq 1 ] && echo ' and 53/udp') in firewalld (uninstall keeps rules unless --purge-firewall)"
   else
-    warn "no active ufw/firewalld: ensure $port/tcp${DNS_ZONE:+ and 53/udp} are reachable on the host/provider firewall"
+    warn "no active ufw/firewalld: ensure $port/tcp$([ "$DNS_CARRIER" -eq 1 ] && echo ' and 53/udp') are reachable on the host/provider firewall"
   fi
 }
 
@@ -1049,7 +1167,8 @@ do_init() {
   if [ -f "$CONF" ]; then log "keeping existing $CONF"; return; fi
   local args=(init -config "$CONF" -decoy "$DECOY")
   [ -n "$LISTEN" ] && args+=(-listen "$LISTEN")
-  [ -n "$DNS_ZONE" ] && args+=(-dns-listen :53 -dns-zone "$DNS_ZONE")
+  [ -n "$DOMAIN" ] && args+=(-domain "$DOMAIN")
+  [ "$DNS_CARRIER" -eq 1 ] && args+=(-dns)
   [ "$LOWKEY" -eq 1 ] && args+=(-admin-listen "127.0.0.1:$(pick_admin_port)")
   "$BIN" "${args[@]}"
   fix_conf_owner
@@ -1086,33 +1205,66 @@ do_enroll() {
   fi
   if ! grep -q '^trusted_keys: \[\]' "$CONF"; then log "already enrolled"; ENROLLED=1; return; fi
   if [ "$REGISTER" -eq 1 ]; then
-    [ -n "$SNI" ] || die "--register needs --sni HOST"
-    local args=(register -config "$CONF" -control "$CONTROL" -sni "$SNI" -port "$(listen_port)")
+    [ -n "$DOMAIN" ] || die "--register needs --domain HOST"
+    local args=(register -config "$CONF" -control "$CONTROL" -domain "$DOMAIN" -port "$(listen_port)")
     [ -n "$PIN" ] && args+=(-pin "$PIN")
-    if [ -n "$DNS_ZONE" ]; then
-      args+=(-dns-port 53 -dns-zone "$DNS_ZONE")
-    fi
-    # Community register stores control_url (and optional pin) for beats.
+    [ "$DNS_CARRIER" -eq 1 ] && args+=(-dns)
+    # Community register stores control_url; beat_mode defaults to normal in the binary.
     "$BIN" "${args[@]}"
     fix_conf_owner
+    if [ "$DONATE" -eq 1 ] || [ -n "$EMAIL" ]; then
+      local profile_args=(profile -config "$CONF")
+      [ "$DONATE" -eq 1 ] && profile_args+=(-public)
+      [ -n "$EMAIL" ] && profile_args+=(-email "$EMAIL")
+      "$BIN" "${profile_args[@]}"
+    fi
+    apply_ops_config
     ENROLLED=1
     return
   fi
   # Curated enroll requires a token unless --init-only.
   if [ -z "${ENROLL_TOKEN:-}" ] && [ "$TOKEN_STDIN" -eq 0 ] && [ ! -r /dev/tty ]; then
-    die "not enrolled: set ENROLL_TOKEN for curated enroll, pass --register --sni HOST, or --init-only"
+    die "not enrolled: set ENROLL_TOKEN for curated enroll, pass --register --domain HOST, or --init-only"
   fi
   read_token
   local args=(enroll -config "$CONF" -control "$CONTROL" -token -)
   [ -n "$PIN" ] && args+=(-pin "$PIN")
   [ -n "$LISTEN" ] && args+=(-addr "$LISTEN")
-  [ -n "$SNI" ] && args+=(-sni "$SNI")
+  [ -n "$DOMAIN" ] && args+=(-domain "$DOMAIN")
+  [ -n "$BEAT_MODE" ] && args+=(-beat-mode "$BEAT_MODE")
+  [ "$STORE_CONTROL" -eq 1 ] && args+=(-store-control)
   # The token goes through stdin, never argv. ponytail: the control URL is in argv
-  # for the seconds enroll runs (visible to `ps`); it is not stored anywhere.
+  # for the seconds enroll runs (visible to `ps`); override is stored only with -store-control.
   printf '%s\n' "$ENROLL_TOKEN" | "$BIN" "${args[@]}"
   unset ENROLL_TOKEN
   fix_conf_owner
+  apply_ops_config
   ENROLLED=1
+}
+
+# apply_ops_config sets beat mode / bandwidth / sni after enroll or register.
+apply_ops_config() {
+  local mode="$BEAT_MODE" conf_args=(configure -config "$CONF")
+  if [ -z "$mode" ]; then
+    if [ "$REGISTER" -eq 1 ]; then mode=normal; else mode=disabled; fi
+  fi
+  case "$mode" in
+    disabled|normal|conservative|telemetry) ;;
+    *) die "invalid --beat-mode: $mode (want disabled|normal|conservative|telemetry)" ;;
+  esac
+  conf_args+=(-beat-mode "$mode")
+  if [ "$REGISTER" -eq 1 ] && [ "$mode" != "normal" ] && [ "$mode" != "disabled" ]; then
+    warn "beat_mode=$mode will not keep community relays in pools (core stale window is 90s)"
+  fi
+  if [ -n "$DOMAIN" ]; then conf_args+=(-domain "$DOMAIN"); fi
+  if [ -n "$BW_INGRESS" ]; then conf_args+=(-bandwidth-ingress "$BW_INGRESS"); fi
+  if [ -n "$BW_EGRESS" ]; then conf_args+=(-bandwidth-egress "$BW_EGRESS"); fi
+  if [ -n "$BW_AVG_CAP" ] || [ -n "$BW_THROTTLE" ]; then
+    [ -n "$BW_AVG_CAP" ] && [ -n "$BW_THROTTLE" ] || die "--bw-avg-cap and --bw-throttle go together"
+    conf_args+=(-avg-window 24h -avg-cap "$BW_AVG_CAP" -throttle "$BW_THROTTLE")
+  fi
+  "$BIN" "${conf_args[@]}"
+  fix_conf_owner
 }
 
 # Self-audit (lowkey): no installer-created name, path, file, binary, process,
@@ -1126,7 +1278,7 @@ audit() {
   done
   # Key material is random base64 and can spell a token by chance: skip those lines.
   if grep -vE '^[[:space:]]*(identity_key:|- )' "$CONF" | grep -Eqi "$FORBIDDEN"; then
-    row FAIL "content of $CONF (check --decoy host and --dns-zone)"; else row ok "content: $CONF"; fi
+    row FAIL "content of $CONF (check --decoy host and --domain)"; else row ok "content: $CONF"; fi
   if grep -Eqi "$FORBIDDEN" "$UNIT_FILE"; then row FAIL "content of $UNIT_FILE"; else row ok "content: $UNIT_FILE"; fi
   for f in "$BIN" "$BIN.prev"; do
     [ -f "$f" ] || continue
@@ -1190,26 +1342,38 @@ case "$ACTION" in
 esac
 
 [ -f "$UNIT_FILE" ] && die "an install named $NAME exists: use --upgrade, or --uninstall first"
-[ -z "$SNI" ] || [ "$REGISTER" -eq 1 ] || true
-[ "$REGISTER" -eq 0 ] || [ -n "$SNI" ] || die "--register needs --sni HOST"
+[ -z "$DOMAIN" ] || [ "$REGISTER" -eq 1 ] || true
+[ "$REGISTER" -eq 0 ] || [ -n "$DOMAIN" ] || die "--register needs --domain HOST"
+[ "$REGISTER" -eq 1 ] || { [ "$DONATE" -eq 0 ] && [ -z "$EMAIL" ]; } || die "--donate and --email require --register"
+if [ -n "$EMAIL" ]; then
+  printf '%s' "$EMAIL" | grep -Eq '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$' || die "--email looks invalid"
+fi
 printf '%s' "$CONTROL" | grep -Eq '^https://' || die "--control must be an https URL"
-[ "$NO_BEAT" -eq 0 ] || [ "$REGISTER" -eq 1 ] || warn "--no-beat only affects community installs that store control_url"
+if [ -n "$BEAT_MODE" ]; then
+  case "$BEAT_MODE" in
+    disabled|normal|conservative|telemetry) ;;
+    *) die "invalid --beat-mode: $BEAT_MODE" ;;
+  esac
+fi
+if [ -n "$BW_AVG_CAP" ] || [ -n "$BW_THROTTLE" ]; then
+  [ -n "$BW_AVG_CAP" ] && [ -n "$BW_THROTTLE" ] || die "--bw-avg-cap and --bw-throttle go together"
+fi
 
 if [ -n "$LISTEN" ]; then validate_listen "$LISTEN"; fi
-if [ -n "$SNI" ]; then check_domain_dns "$SNI"; fi
+if [ -n "$DOMAIN" ]; then check_domain_dns "$DOMAIN"; fi
 check_dns_carrier
 preflight_host
 
 if [ "$SETUP_DECOY" -eq 1 ]; then
-  [ -n "$SNI" ] || die "--setup-decoy needs --sni DOMAIN"
-  run_guided_decoy "$SNI"
+  [ -n "$DOMAIN" ] || die "--setup-decoy needs --domain DOMAIN"
+  run_guided_decoy "$DOMAIN"
 fi
 check_decoy
 
 # Non-interactive curated without token must fail unless --init-only.
 if [ "$ACTION" = install ] && [ "$REGISTER" -eq 0 ] && [ "$INIT_ONLY" -eq 0 ] && [ "$NONINTERACTIVE" -eq 1 ]; then
   if [ -z "${ENROLL_TOKEN:-}" ] && [ "$TOKEN_STDIN" -eq 0 ]; then
-    die "curated install needs ENROLL_TOKEN (or --token-stdin), --register --sni HOST, or --init-only"
+    die "curated install needs ENROLL_TOKEN (or --token-stdin), --register --domain HOST, or --init-only"
   fi
 fi
 
@@ -1234,7 +1398,7 @@ else
     log "init-only complete: enroll/register then systemctl enable --now $NAME"
   elif [ "$ENROLLED" -ne 1 ]; then
     if [ "$REGISTER" -eq 1 ]; then
-      warn "not registered: $BIN register -config $CONF -control URL -sni HOST   then   systemctl enable --now $NAME"
+      warn "not registered: $BIN register -config $CONF -control URL -domain HOST   then   systemctl enable --now $NAME"
     else
       warn "not enrolled: enroll, then start. e.g. printf '%s\\n' \"\$TOKEN\" | $BIN enroll -config $CONF -control URL -token -   then   systemctl enable --now $NAME"
     fi
@@ -1248,7 +1412,7 @@ if [ "$GENERATED_NAME" -eq 1 ]; then
   echo
   log "install name (shown once, needed for --upgrade/--rollback/--uninstall): $NAME"
 fi
-if [ -n "$SNI" ]; then
-  log "domain/sni=$SNI listen=${LISTEN:-:443} decoy=$DECOY"
+if [ -n "$DOMAIN" ]; then
+  log "domain=$DOMAIN dns_carrier=$([ "$DNS_CARRIER" -eq 1 ] && echo on || echo off) listen=${LISTEN:-:443} decoy=$DECOY"
 fi
 log "done. Follow your host's acceptable-use policy; lowkey reduces fingerprinting and does not make a relay undetectable."

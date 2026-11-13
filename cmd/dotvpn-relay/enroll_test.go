@@ -73,18 +73,21 @@ func TestRegisterProofOfPossession(t *testing.T) {
 
 	pin := transport.SPKIPin(srv.Certificate())
 	args := []string{
-		"-config", cfgPath, "-control", srv.URL, "-sni", "cdn.example.com",
+		"-config", cfgPath, "-control", srv.URL, "-domain", "cdn.example.com",
 		"-port", "443", "-pin", pin,
 	}
 	if err := cmdRegister(context.Background(), args); err != nil {
 		t.Fatal(err)
 	}
-	if gotBody["sni"] != "cdn.example.com" || gotBody["public_key"] != auth.EncodeKey(pub) {
+	if gotBody["domain"] != "cdn.example.com" || gotBody["public_key"] != auth.EncodeKey(pub) {
 		t.Fatalf("register body: %#v", gotBody)
+	}
+	if dns, _ := gotBody["dns"].(bool); dns {
+		t.Fatalf("dns want false: %#v", gotBody["dns"])
 	}
 	sig, _ := gotBody["signature"].(string)
 	ts := int64(gotBody["timestamp"].(float64))
-	msg := []byte(fmt.Sprintf("register|%s|%d|%s|%d|%s|%d", auth.EncodeKey(pub), 443, "cdn.example.com", 0, "", ts))
+	msg := []byte(fmt.Sprintf("register|%s|%d|%s|%d|%d", auth.EncodeKey(pub), 443, "cdn.example.com", 0, ts))
 	raw, err := base64.RawURLEncoding.DecodeString(sig)
 	if err != nil || !ed25519.Verify(pub, msg, raw) {
 		t.Fatalf("signature does not match core registerMessage: %v", err)
@@ -100,8 +103,74 @@ func TestRegisterProofOfPossession(t *testing.T) {
 	if c.RelayID != "rid" || c.Name != "quiet-grove-abcd" || c.ControlURL != wantCtrl.String() || c.ControlPin != pin {
 		t.Fatalf("config not updated: %+v", c)
 	}
+	if c.BeatMode != config.BeatNormal {
+		t.Fatalf("beat_mode = %q, want normal for community register", c.BeatMode)
+	}
+	if c.Domain != "cdn.example.com" {
+		t.Fatalf("domain = %q", c.Domain)
+	}
+	if c.DNSListen != "" {
+		t.Fatalf("dns_listen = %q, want empty", c.DNSListen)
+	}
 	if len(c.TrustedKeys) != 1 || c.TrustedKeys[0] != "ctl" {
 		t.Fatalf("trusted_keys: %v", c.TrustedKeys)
+	}
+}
+
+func TestProfileProofOfPossession(t *testing.T) {
+	var got struct {
+		RelayID   string  `json:"relay_id"`
+		PublicKey string  `json:"public_key"`
+		Public    *bool   `json:"public"`
+		Email     *string `json:"email"`
+		Country   *string `json:"country"`
+		Timestamp int64   `json:"timestamp"`
+		Signature string  `json:"signature"`
+	}
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/relays/profile" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("body: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"relay_id": "rid", "is_public": true, "is_system": false, "status": "active",
+			"email": "ops@example.com", "country": "IR",
+		})
+	}))
+	defer srv.Close()
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := parseControlURL(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	isPublic := true
+	email := "ops@example.com"
+	country := "ir"
+	c := &config.Config{
+		RelayID: "rid", IdentityKey: auth.EncodeKey(priv),
+		ControlURL: base.String(), ControlPin: transport.SPKIPin(srv.Certificate()),
+	}
+	out, err := updateRelayProfile(context.Background(), c, &isPublic, &email, &country)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.IsPublic || out.IsSystem || out.Email != email || out.Country != "IR" {
+		t.Fatalf("response: %+v", out)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(got.Signature)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := []byte(fmt.Sprintf("profile|rid|1|%s|%s|%d", email, country, got.Timestamp))
+	if got.PublicKey != auth.EncodeKey(priv.Public().(ed25519.PublicKey)) || got.Public == nil || !*got.Public ||
+		!ed25519.Verify(priv.Public().(ed25519.PublicKey), msg, raw) {
+		t.Fatal("profile signature is invalid")
 	}
 }
 

@@ -14,7 +14,11 @@ import (
 	"time"
 
 	"github.com/payam-foundation/dotvpn-relay/internal/config"
+	"github.com/payam-foundation/dotvpn-relay/internal/domaincheck"
 )
+
+// status is local-only: config + loopback metrics + unit + domain DNS/TLS.
+// It never contacts control.
 
 func cmdStatus(ctx context.Context, args []string) error {
 	fs, cfg := flags("status")
@@ -28,29 +32,65 @@ func cmdStatus(ctx context.Context, args []string) error {
 	}
 	unit := prog() + ".service"
 	fmt.Printf("config:  %s\n", path)
+	fmt.Printf("version: %s\n", version)
 	fmt.Printf("listen:  %s\n", c.Listen)
 	fmt.Printf("admin:   %s\n", c.AdminListen)
-	if c.DNSZone != "" {
-		fmt.Printf("dns:     %s on %s\n", c.DNSZone, c.DNSListen)
+	if c.DNSListen != "" {
+		fmt.Printf("dns:     carrier zone=%s on %s\n", c.Domain, c.DNSListen)
 	} else {
 		fmt.Printf("dns:     off\n")
 	}
 	if c.Decoy != "" {
 		fmt.Printf("decoy:   %s\n", c.Decoy)
 	}
+	if c.MaxConns > 0 {
+		fmt.Printf("max_conns: %d\n", c.MaxConns)
+	}
+	if c.MaxPoolPerNode > 0 || c.MaxPool > 0 {
+		fmt.Printf("pool:    per_node=%d max=%d\n", c.MaxPoolPerNode, c.MaxPool)
+	}
+	resolved, rerr := resolveControlURL(c.ControlURL)
+	fmt.Printf("beat:    mode=%s\n", c.BeatMode)
+	if rerr == nil {
+		fmt.Printf("control: %s (override=%s)\n", resolved.String(), boolStr(c.ControlURL != ""))
+	}
+	if c.BandwidthIngressMbps > 0 || c.BandwidthEgressMbps > 0 {
+		fmt.Printf("bw_cap:  in=%.2fMbps out=%.2fMbps\n", c.BandwidthIngressMbps, c.BandwidthEgressMbps)
+	}
+	if c.BandwidthAvgWindow != "" {
+		fmt.Printf("bw_avg:  window=%s cap=%.2fMbps throttle=%.2fMbps\n",
+			c.BandwidthAvgWindow, c.BandwidthAvgCapMbps, c.BandwidthThrottleMbps)
+	}
 	if c.RelayID != "" {
 		fmt.Printf("relay:   %s\n", c.RelayID)
+		fmt.Printf("invite:  %s\n", relayInviteURI(c.RelayID))
+		// status stays local (no control contact). Use `profile` for listing/email.
+	}
+	if domain := c.CheckDomain(); domain != "" {
+		fmt.Printf("domain:  %s\n", domain)
+		dctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		rep := domaincheck.Check(dctx, domain, c.Listen, c.DNSListen)
+		cancel()
+		printDomainReport(rep)
+	} else {
+		fmt.Printf("domain:  (unset)\n")
 	}
 	fmt.Printf("unit:    %s\n", unitState(ctx, unit))
-	parked, active, herr := fetchMetrics(ctx, c.AdminListen)
+	parked, active, bytesIn, bytesOut, sessions, herr := fetchMetrics(ctx, c.AdminListen)
 	if herr != nil {
 		fmt.Printf("health:  %v\n", herr)
 		return nil
 	}
 	fmt.Printf("health:  ok\n")
-	fmt.Printf("parked:  %d\n", parked)
-	fmt.Printf("active:  %d\n", active)
+	fmt.Printf("parked:  %d  (idle node tunnels)\n", parked)
+	fmt.Printf("active:  %d  (in-flight sessions)\n", active)
+	fmt.Printf("bytes:   in=%d out=%d\n", bytesIn, bytesOut)
+	fmt.Printf("sessions:%d  (lifetime)\n", sessions)
 	return nil
+}
+
+func relayInviteURI(id string) string {
+	return "dvr://" + id
 }
 
 func cmdDoctor(ctx context.Context, args []string) error {
@@ -84,11 +124,12 @@ func cmdDoctor(ctx context.Context, args []string) error {
 		check(true, "healthz", "ok at "+c.AdminListen)
 	}
 
-	parked, active, err := fetchMetrics(ctx, c.AdminListen)
+	parked, active, bytesIn, bytesOut, sessions, err := fetchMetrics(ctx, c.AdminListen)
 	if err != nil {
 		check(false, "metrics", err.Error())
 	} else {
-		check(true, "metrics", fmt.Sprintf("parked=%d active=%d", parked, active))
+		check(true, "metrics", fmt.Sprintf("parked=%d active=%d bytes_in=%d bytes_out=%d sessions=%d",
+			parked, active, bytesIn, bytesOut, sessions))
 	}
 
 	_, port, err := splitHostPortDefault(c.Listen, "443")
@@ -130,10 +171,33 @@ func cmdDoctor(ctx context.Context, args []string) error {
 		check(true, "disk", fmt.Sprintf("/ has %d kB free", free))
 	}
 
+	dctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	rep := domaincheck.Check(dctx, c.CheckDomain(), c.Listen, c.DNSListen)
+	cancel()
+	for _, r := range rep.Results {
+		if r.Skipped {
+			fmt.Printf("  skip  %s: %s\n", r.Name, r.Detail)
+			continue
+		}
+		check(r.OK, "domain/"+r.Name, r.Detail)
+	}
+
 	if failed > 0 {
 		return fmt.Errorf("%d check(s) failed", failed)
 	}
 	return nil
+}
+
+func printDomainReport(rep domaincheck.Report) {
+	for _, r := range rep.Results {
+		mark := "ok"
+		if r.Skipped {
+			mark = "skip"
+		} else if !r.OK {
+			mark = "FAIL"
+		}
+		fmt.Printf("  %-5s %s: %s\n", mark, r.Name, r.Detail)
+	}
 }
 
 func unitState(ctx context.Context, unit string) string {
@@ -167,20 +231,20 @@ func pingHealthz(ctx context.Context, addr string) error {
 	return nil
 }
 
-func fetchMetrics(ctx context.Context, addr string) (parked, active int, err error) {
+func fetchMetrics(ctx context.Context, addr string) (parked, active int, bytesIn, bytesOut, sessions int, err error) {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, adminURL(addr, "/metrics"), nil)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, 0, 0, err
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, 0, 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return 0, 0, fmt.Errorf("HTTP %s", resp.Status)
+		return 0, 0, 0, 0, 0, fmt.Errorf("HTTP %s", resp.Status)
 	}
 	return parseMetrics(resp.Body)
 }
@@ -189,7 +253,7 @@ func adminURL(addr, path string) string {
 	return "http://" + addr + path
 }
 
-func parseMetrics(r io.Reader) (parked, active int, err error) {
+func parseMetrics(r io.Reader) (parked, active, bytesIn, bytesOut, sessions int, err error) {
 	parked, active = -1, -1
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
@@ -211,18 +275,24 @@ func parseMetrics(r io.Reader) (parked, active int, err error) {
 			parked = n
 		case strings.HasSuffix(name, "_active"):
 			active = n
+		case strings.HasSuffix(name, "_bytes_in"):
+			bytesIn = n
+		case strings.HasSuffix(name, "_bytes_out"):
+			bytesOut = n
+		case strings.HasSuffix(name, "_sessions"):
+			sessions = n
 		}
 	}
 	if err := sc.Err(); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, 0, 0, err
 	}
 	if parked < 0 {
-		return 0, 0, errors.New("parked metric missing")
+		return 0, 0, 0, 0, 0, errors.New("parked metric missing")
 	}
 	if active < 0 {
 		active = 0
 	}
-	return parked, active, nil
+	return parked, active, bytesIn, bytesOut, sessions, nil
 }
 
 func splitHostPortDefault(addr, defPort string) (host, port string, err error) {
