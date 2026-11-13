@@ -164,6 +164,26 @@ This lowers fingerprinting by scanners and casual inspection. It does not make a
 
 Residual risks: tunnelled traffic keeps its packet-size and timing shape, and hosting netflow, payment identity and host conntrack link a relay to its operator.
 
+## Sizing
+
+The relay splices bytes and holds no user state, so it needs far less than a core node.
+
+Measured on a Hetzner ARM VPS (2 vCPU Neoverse-N1, 3.8 GiB RAM) with the relay and nginx decoy on one box:
+
+| State | Relay CPU | Relay RSS |
+| --- | --- | --- |
+| idle | under 1% | 14 MB |
+| 8 parallel 50 MB downloads, about 12 MB/s (about 100 Mbps) total | about 11% of one core | 22 MiB |
+
+That is about 0.11% of a core per Mbps, so a single core would pass roughly 900 Mbps. This is extrapolated from the 100 Mbps point and was not run to saturation.
+
+| Node | Practical ceiling | Notes |
+| --- | --- | --- |
+| 1 vCPU, 512 MB | the port speed | RAM is not the limit |
+| 2 vCPU, 2 GB | the port speed | what the measurement above ran on |
+
+Pick the relay by its bandwidth allowance and port speed, not CPU or RAM. Set `bandwidth_ingress_mbps`, `bandwidth_egress_mbps` and the average cap to the provider's allowance so the relay throttles itself before the provider does.
+
 ## Threat model
 
 | Resists | Does not resist |
