@@ -24,7 +24,7 @@
 #        --dns-carrier      enable the DNS carrier on :53 (zone = --domain; off by default)
 #        --require-dns      fail if --domain does not resolve to this host
 #        --init-only        install binary+config without enroll/register/start
-#        --lowkey           neutral build; every name derives from --name (see ADR-016)
+#        --lowkey           neutral build; every name derives from --name (see ADR-017)
 #        --name N           lowkey install name (random if omitted, printed at the end)
 #        --quiet-logs       journald LogLevelMax=warning for the unit
 #        --beat-mode MODE   disabled|normal|conservative|telemetry
@@ -54,7 +54,7 @@
 # Control URL and beat mode are independent. Curated enroll defaults to no
 # control_url override + beat disabled (ADR-012). Community register stores
 # control_url and defaults beat_mode=normal for pool liveness.
-# Decoy is the operator's real site (ADR-015/016). --setup-decoy may install a
+# Decoy is the operator's real site (ADR-016/017). --setup-decoy may install a
 # system Caddy/nginx for the operator domain; Caddy is never embedded in the binary.
 set -euo pipefail
 
@@ -1056,7 +1056,7 @@ ensure_user() {
 }
 
 check_decoy() {
-  [ -n "$DECOY" ] || die "--decoy HOST:PORT is required: point it at your real TLS web server (ADR-015), or pass --setup-decoy"
+  [ -n "$DECOY" ] || die "--decoy HOST:PORT is required: point it at your real TLS web server (ADR-016), or pass --setup-decoy"
   printf '%s' "$DECOY" | grep -Eq '^([^:[:space:]]+|\[[0-9a-fA-F:]+\]):[0-9]{1,5}$' || die "--decoy must be HOST:PORT"
   decoy_host_port
   case "$DECOY_HOST" in

@@ -138,7 +138,7 @@ func (s *Server) ServeTCP(ctx context.Context, ln net.Listener) error {
 			return err
 		}
 		if !s.acquire() {
-			// Probe resistance (ADR-014): under load, still answer like a real site.
+			// Probe resistance (ADR-015): under load, still answer like a real site.
 			s.o.Fallback(c)
 			continue
 		}

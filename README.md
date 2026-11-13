@@ -12,7 +12,7 @@
 
 The in-country stealth hop of [Dot VPN](https://github.com/payam-foundation/dotvpn-wire#related-repositories). A relay looks like an ordinary HTTPS website to anyone who is not a Dot VPN client, and splices clients onto tunnels that a `dotvpn-core` node has parked on it.
 
-A relay has **no client code, no admin code, and no user accounts**. It holds its own identity key and control's public key. **Control URL** and **beat mode** are independent (ADR-024): empty `control_url` resolves to `https://ctrl.dotvpn.org/api` when beats need it; `beat_mode` defaults to `disabled`. Curated enroll keeps the seizure posture (no URL override + disabled). Community `register` stores the control used and sets `beat_mode=normal` (required for pool membership; core drops `requires_beat` relays after ~90s without a beat). Modes: `normal` (~45–75s), `conservative` (1h telemetry), `telemetry` (12h), `disabled`.
+A relay has **no client code, no admin code, and no user accounts**. It holds its own identity key and control's public key. **Control URL** and **beat mode** are independent: empty `control_url` resolves to `https://ctrl.dotvpn.org/api` when beats need it; `beat_mode` defaults to `disabled`. Curated enroll keeps the seizure posture (no URL override + disabled). Community `register` stores the control used and sets `beat_mode=normal` (required for pool membership; core drops `requires_beat` relays after ~90s without a beat). Modes: `normal` (~45–75s), `conservative` (1h telemetry), `telemetry` (12h), `disabled`.
 
 ## Status
 
@@ -58,7 +58,7 @@ dotvpn-relay enroll -config /etc/dotvpn-relay/config.yaml -token <one-time token
 dotvpn-relay run    -config /etc/dotvpn-relay/config.yaml
 ```
 
-The control URL is used for enroll and **not** written to disk by default (ADR-012). Pass `-beat-mode normal` (and `-store-control` for a non-default plane) to opt into beats. For a self-signed control certificate, pass `-control https://…` and `-pin <base64 SHA-256 SPKI>`.
+The control URL is used for enroll and **not** written to disk by default. Pass `-beat-mode normal` (and `-store-control` for a non-default plane) to opt into beats. For a self-signed control certificate, pass `-control https://…` and `-pin <base64 SHA-256 SPKI>`.
 
 Bare TTY (`dvrelay` / `dotvpn-relay`) opens a local **TUI**. `status` prints plain metrics for scripts (version, parked, active, bytes, sessions, beat mode, bandwidth).
 
@@ -70,7 +70,7 @@ To change beats later: `dotvpn-relay beat normal|conservative|telemetry|disabled
 |---|---|---|
 | `beat_mode` | `disabled` | `disabled` \| `normal` \| `conservative` \| `telemetry` |
 | `control_url` | (empty → production default) | Optional control API override |
-| `domain` | from enroll/register | Singular hostname: TLS SNI and DNS carrier zone when enabled (ADR-025); local DNS/TLS checks (catalog updates stay on admin). Obsolete: `sni` / `dns_zone` |
+| `domain` | from enroll/register | Singular hostname: TLS SNI and DNS carrier zone when enabled; local DNS/TLS checks (catalog updates stay on admin). Obsolete: `sni` / `dns_zone` |
 | `max_conns` | 4096 | Concurrent in-flight TCP/DNS sessions |
 | `max_pool_per_node` | 16 | Parked reverse tunnels per node |
 | `max_pool` | 1024 | Global parked-tunnel cap |
@@ -107,7 +107,7 @@ Compose comments cover `init` / `enroll` / `register` against the data volume.
 
 Prefer download → inspect → run. `deploy/install.sh` installs a release under a hardened systemd unit (dedicated user, 0640 config). SHA-256 checks the binary against `checksums.txt`; when `cosign` is on PATH (or `REQUIRE_COSIGN=1`), the installer also verifies `checksums.txt.sigstore.json`.
 
-**Decoy geometry.** The decoy is a real TLS web server you operate (ADR-015). The relay listens on the public address (typically `PUBLIC_IP:443`); the decoy binds loopback (e.g. `127.0.0.1:8443`). They cannot share the same socket. Point DNS A/AAAA for your domain at the relay host with **DNS-only** records — a proxied CDN terminates TLS and breaks the knock. Interactive install can reuse an existing nginx/Caddy or run `--setup-decoy` to install a system Caddy/nginx for your domain (never embedded in the relay binary).
+**Decoy geometry.** The decoy is a real TLS web server you operate. The relay listens on the public address (typically `PUBLIC_IP:443`); the decoy binds loopback (e.g. `127.0.0.1:8443`). They cannot share the same socket. Point DNS A/AAAA for your domain at the relay host with **DNS-only** records — a proxied CDN terminates TLS and breaks the knock. Interactive install can reuse an existing nginx/Caddy or run `--setup-decoy` to install a system Caddy/nginx for your domain (never embedded in the relay binary).
 
 **Interactive** (TTY; curated asks for the enroll token first and loads listen/domain/DNS from control so those prompts are skipped; community shows this host’s IP then asks domain/listen; decoy always; DNS carrier under Advanced):
 
@@ -133,7 +133,7 @@ curl -fsSL https://raw.githubusercontent.com/payam-foundation/dotvpn-relay/main/
     --decoy 127.0.0.1:8443 --listen <public-ip>:443
 ```
 
-Both default `--control` to domain `ctrl.dotvpn.org` (API at `https://ctrl.dotvpn.org/api`). Pass a bare domain; the installer/CLI append `/api`. A curated token must be redeemed against the **same** control that minted it. The enroll token travels by environment or stdin (`enroll -token -`), never argv. Curated non-interactive installs without a token fail unless `--init-only`. Interactive install asks for beat mode and optional bandwidth caps separately from the control domain. Preflight covers packages, disk/mem/swap, listen-port conflicts, firewall/fail2ban asks, and DNS-carrier vs systemd-resolved (`--fix-resolved` / `--skip-dns-carrier`). `--setup-decoy`, `--require-dns`, `--dns-carrier` (UDP `:53`; zone = `--domain`), `--upgrade`, `--rollback`, `--uninstall` (optional `--purge-firewall`), `--pin`, `--beat-mode`, `--no-beat`, `--store-control`, `--bw-ingress` / `--bw-egress` / `--bw-avg-cap` / `--bw-throttle`, `--from-dir` and `--lowkey` are in `install.sh --help`. A failed enroll/register removes what the install created. The DNS carrier (`--dns` / local `dns_listen`) is off by default; it is a UDP/53 protocol suffix, not normal authoritative DNS hosting. **Obsolete:** `--sni`, `--dns-zone`, and any guidance that SNI ≠ zone — one `domain` covers both (ADR-025). Standard installs also place a `dvrelay` symlink to `dotvpn-relay` for local ops (bare `dvrelay` opens the TUI; `dvrelay status` / `dvrelay doctor` for scripts).
+Both default `--control` to domain `ctrl.dotvpn.org` (API at `https://ctrl.dotvpn.org/api`). Pass a bare domain; the installer/CLI append `/api`. A curated token must be redeemed against the **same** control that minted it. The enroll token travels by environment or stdin (`enroll -token -`), never argv. Curated non-interactive installs without a token fail unless `--init-only`. Interactive install asks for beat mode and optional bandwidth caps separately from the control domain. Preflight covers packages, disk/mem/swap, listen-port conflicts, firewall/fail2ban asks, and DNS-carrier vs systemd-resolved (`--fix-resolved` / `--skip-dns-carrier`). `--setup-decoy`, `--require-dns`, `--dns-carrier` (UDP `:53`; zone = `--domain`), `--upgrade`, `--rollback`, `--uninstall` (optional `--purge-firewall`), `--pin`, `--beat-mode`, `--no-beat`, `--store-control`, `--bw-ingress` / `--bw-egress` / `--bw-avg-cap` / `--bw-throttle`, `--from-dir` and `--lowkey` are in `install.sh --help`. A failed enroll/register removes what the install created. The DNS carrier (`--dns` / local `dns_listen`) is off by default; it is a UDP/53 protocol suffix, not normal authoritative DNS hosting. **Obsolete:** `--sni`, `--dns-zone`, and any guidance that SNI ≠ zone — one `domain` covers both. Standard installs also place a `dvrelay` symlink to `dotvpn-relay` for local ops (bare `dvrelay` opens the TUI; `dvrelay status` / `dvrelay doctor` for scripts).
 
 ### Ports
 
@@ -152,17 +152,17 @@ sudo ENROLL_TOKEN=<token> bash install.sh --lowkey --quiet-logs \
   --decoy 127.0.0.1:8443 --listen <public-ip>:443
 ```
 
-This lowers fingerprinting by scanners and casual inspection. It does not make a relay undetectable (traffic shape, IP and payment links remain, see the threat model), and it does not override your host's terms: read and follow its acceptable-use policy and the law where you live. Design and residual risks: [ADR-016](docs/adr/016-lowkey-install.md).
+This lowers fingerprinting by scanners and casual inspection. It does not make a relay undetectable (traffic shape, IP and payment links remain, see the threat model), and it does not override your host's terms: read and follow its acceptable-use policy and the law where you live. Residual risks are listed in the threat model.
 
 ### Production guidance
 
 - **Use a real decoy.** Point `-decoy` at a stock nginx or Caddy with a real certificate for a plausible domain (any geography; no software geo-check). It should send no HTTP/3 `alt-svc` (the relay is TCP-only), keep its own `Server` header and error pages, and have no admin API. The built-in decoy (`-tls-cert`, `-tls-key`) exists for tests. Installer `--setup-decoy` can provision a system Caddy/nginx on loopback for your domain.
-- **Domain.** One hostname (`domain`): clients and nodes present it as TLS SNI, and it is the DNS carrier zone when the carrier is on (ADR-025). Point DNS-only A/AAAA at this host — no proxied CDN. Obsolete: separate `sni` / `dns_zone` / “SNI ≠ zone”.
+- **Domain.** One hostname (`domain`): clients and nodes present it as TLS SNI, and it is the DNS carrier zone when the carrier is on. Point DNS-only A/AAAA at this host — no proxied CDN. Obsolete: separate `sni` / `dns_zone` / “SNI ≠ zone”.
 - **One relay, many nodes.** Each node parks its own tunnels, keyed by node ID. Give each user cohort its own relay set, so revoking one relay does not affect the others.
 - **DNS carrier.** Optional. Enable with installer `--dns-carrier`, CLI `-dns`, or YAML `dns_listen` (zone is always `domain`; catalog `dns_carrier`). If only systemd-resolved's stub holds loopback :53, the installer asks to disable `DNSStubListener`, skip the carrier, or abort (`--fix-resolved` / `--skip-dns-carrier` when non-interactive). A non-stub listener on :53 still fails hard.
 - **Community visibility.** Self-registered relays start `public=false`; an admin promotes them with `PATCH /v1/admin/relays/{id}` (`public: true`). They must beat about every 30–45s or they leave node pools after ~90s.
 
-Rationale and residual risks: [ADR-015](docs/adr/015-relay-operational-exposure.md).
+Residual risks: tunnelled traffic keeps its packet-size and timing shape, and hosting netflow, payment identity and host conntrack link a relay to its operator.
 
 ## Threat model
 
@@ -177,7 +177,6 @@ The [lab](https://github.com/payam-foundation/dotvpn-lab#what-a-green-result-mea
 
 If a relay is seized or suspected compromised, revoke it at control (`DELETE /v1/admin/relays/{id}`) and replace it with a new identity. Nothing on a curated host reaches core; a community host may still name control in `control_url`.
 
-Design decisions: [enrollment](docs/adr/012-relay-enrollment.md), [reverse-first](docs/adr/013-reverse-first-relay.md), [probe resistance](docs/adr/014-probe-resistance.md), [operational exposure](docs/adr/015-relay-operational-exposure.md), [lowkey install](docs/adr/016-lowkey-install.md).
 
 ## Verify a release
 
@@ -224,7 +223,7 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) first. Report vulnerabilities as describ
 | [dotvpn-core](https://github.com/payam-foundation/dotvpn-core) | Server: node, control plane |
 | [dotvpn-client](https://github.com/payam-foundation/dotvpn-client) | Client library and `dotvpn` CLI |
 | [dotvpn-android](https://github.com/payam-foundation/dotvpn-android) | Android app |
-| [dotvpn-lab](https://github.com/payam-foundation/dotvpn-lab) | Censorship lab, architecture and ADR index |
+| [dotvpn-lab](https://github.com/payam-foundation/dotvpn-lab) | Censorship lab and black-box tests |
 
 ## License
 
