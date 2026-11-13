@@ -14,10 +14,10 @@ go test -race -count=1 ./...
 ## Invariants
 
 - Holds no client or admin code. Do not import anything that belongs to core or client.
-- Stores no secrets beyond its own identity key and control's public key; no static shared key (ADR-012, ADR-013). `control_url` is an optional override (empty → ctrl.dotvpn.org/api); `beat_mode` is the beat switch (ADR-024). Admin `enroll` defaults to no override + `disabled`. Community `register` stores the URL used and `beat_mode=normal`.
+- Stores no secrets beyond its own identity key and control's public key; no static shared key (ADR-012, ADR-013). `control_url` is an optional override (empty → ctrl.dotvpn.org/api); `beat_mode` is the beat switch (ADR-014). Admin `enroll` defaults to no override + `disabled`. Community `register` stores the URL used and `beat_mode=normal`.
 - No access logs, no client IPs, no version banner, no domains or keys in errors or metrics.
-- Unauthenticated, invalid, replayed or probing connections are replayed byte for byte to the decoy, never closed or reset; timing stays uniform (ADR-014).
-- The built-in decoy is for tests. Production runs `-decoy` in front of a real web server (ADR-015).
+- Unauthenticated, invalid, replayed or probing connections are replayed byte for byte to the decoy, never closed or reset; timing stays uniform (ADR-015).
+- The built-in decoy is for tests. Production runs `-decoy` in front of a real web server (ADR-016).
 
 ## Shared rules
 
@@ -28,7 +28,7 @@ go test -race -count=1 ./...
 
 ## Docs
 
-`docs/adr/`: ADR-012 through 016. Security report: `../dotvpn-lab/docs/REPORT.md`.
+Design notes: README.
 
 ## Flow
 
