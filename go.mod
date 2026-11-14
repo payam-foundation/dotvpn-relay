@@ -3,7 +3,7 @@ module github.com/payam-foundation/dotvpn-relay
 go 1.27.4
 
 require (
-	github.com/payam-foundation/dotvpn-wire v0.5.0
+	github.com/payam-foundation/dotvpn-wire v0.6.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
