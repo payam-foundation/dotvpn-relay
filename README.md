@@ -20,31 +20,69 @@ Beta. Tested for code correctness and performance on a real host; resistance to 
 
 ## How it works
 
+The relay only listens on public `:443` (and optional DNS UDP). It never dials [dotvpn-core](https://github.com/payam-foundation/dotvpn-core). From the outside it is an ordinary HTTPS site unless the peer presents a valid, unreplayed mimic knock. Shared knock keys, `AudPool`, and the park/splice contract live in [dotvpn-wire](https://github.com/payam-foundation/dotvpn-wire#reverse-path-node--relay--client).
+
 ```mermaid
 flowchart LR
     peer(["Any TCP peer<br/>public :443"])
     knock{"HMAC knock valid<br/>and not replayed?"}
+    classify{"Knock key?"}
     pool[("Parked tunnels<br/>keyed by node ID")]
     node["dotvpn-core node<br/>dials out"]
-    decoy["Operator's web server<br/>--decoy HOST:PORT"]
+    client(["Dot VPN client"])
+    decoy["Operator web server<br/>--decoy HOST:PORT"]
 
     peer --> knock
-    knock -->|"yes: splice frames"| pool
-    node -->|"reverse tunnel"| pool
-    knock -->|"no: bytes forwarded as-is"| decoy
+    knock -->|"no: bytes as-is"| decoy
+    knock -->|yes| classify
+    node -->|"pool key → handshake + AudPool"| pool
+    classify -->|"pool key"| pool
+    client -->|"per-node key"| classify
+    classify -->|"per-node key → splice"| pool
 
     classDef focal fill:#fdf0ea,stroke:#eb6c36,color:#2d3142
     classDef ext fill:#f5f5f5,stroke:#7a8399,stroke-dasharray:4 3,color:#2d3142
-    class knock focal
-    class peer,decoy ext
+    class knock,classify focal
+    class peer,decoy,client ext
 ```
 
-- **Reverse mode.** The relay only listens. The node dials out and parks tunnels, so the node's address is in no client configuration.
-- **Mimic carrier.** A Chrome-like ClientHello carries an HMAC knock. Frames are masked and padded, with X25519 forward secrecy, pool rotation and idle cover traffic.
-- **Optional DNS-shaped UDP carrier** for paths that pass UDP but not TCP.
-- **Decoy for everything else.** Anything that is not a valid, unreplayed knock is handed to a real TLS server and receives that server's answer. There is no silent close or reset on the probe path, and timing stays uniform.
-- **Two ways onto the network.** Admins mint a one-time enroll token (curated). Anyone can `register` as a community relay; control probes the host and may quarantine or promote it. Optional signed beats report version and parked-tunnel count.
-- **No access logs.** No persisted client IPs, no version banner. `/healthz` and `/metrics` bind to loopback only. Beats follow `beat_mode` (or `run -beat-mode` / legacy `-no-beat`).
+### Outside view and decoy
+
+Anything that is not a valid knock is byte-forwarded to the operator's real TLS server (`--decoy`). There is no silent close or reset on the probe path; timing stays uniform. The relay holds no client code, no admin UI, and no user accounts — only its identity key and control's public key.
+
+### Dual knock: park then splice
+
+Two public knock keys keep scanners out; authentication is the handshake and the control-minted pool JWT behind them.
+
+```mermaid
+sequenceDiagram
+    participant Node as node
+    participant Relay as relay
+    participant Client as client
+
+    Node->>Relay: mimic knock (PoolKnockKey)
+    Node->>Relay: handshake (relay pin) + AudPool token
+    Note over Relay: park by node id
+    Client->>Relay: mimic knock (ClientKnockKey for that node)
+    Relay-->>Client: splice onto parked tunnel
+    Client->>Node: handshake (node pin) + muxstream
+    Note over Relay: forwards ciphertext only
+```
+
+Optional **DNS-shaped UDP** uses the same identity: the stream is prefixed with the node id (no hello knock). Frames stay masked and padded, with idle cover traffic on parked links.
+
+### Control plane: enroll, register, beat, profile
+
+| Path | How | Visibility |
+|---|---|---|
+| **Curated `enroll`** | Admin mints a one-time `AudEnroll` JWT; host redeems it. Seizure posture: control URL not stored by default; `beat_mode` stays `disabled` unless you opt in. Usually `IsSystem`; beats optional unless control sets `requires_beat`. | Live for node pools once enrolled |
+| **Community `register`** | Ed25519 over `register\|pk\|port\|domain\|dns\|ts`; control takes peer IP, probes, activates with `RequiresBeat` and `beat_mode=normal`. Starts `IsPublic=false`. | Dropped from pools after ~90s without a beat |
+| **`beat`** | Signed telemetry (version, parked, active). Modes: `normal` (~45–75s), `conservative` (1h), `telemetry` (12h), `disabled`. | Keeps `requires_beat` relays in the live set |
+| **`profile`** | Signed `profile\|…` updates listing/email/country; admin may promote `IsPublic`. | Client catalog: system/public + opted-in ids |
+
+Share `dvr://<relay_id>` with clients that opt into community relays. Fleet policy and ExpandReverse live on control; see [dotvpn-core Relays](https://github.com/payam-foundation/dotvpn-core#relays).
+
+**No access logs.** No persisted client IPs, no version banner. `/healthz` and `/metrics` bind to loopback only.
 
 ## Quick start
 
